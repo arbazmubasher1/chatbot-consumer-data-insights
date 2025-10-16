@@ -7,12 +7,12 @@ from collections import Counter
 import re
 
 # -------------------------------------------------------
-# ✅ MUST BE FIRST STREAMLIT COMMAND
+# ✅ Must be the first Streamlit command
 # -------------------------------------------------------
 st.set_page_config(page_title="Restaurant Complaints Dashboard", page_icon="🍔", layout="wide")
 
 # -------------------------------------------------------
-# DATA LOADING
+# Load data
 # -------------------------------------------------------
 @st.cache_data
 def load_data():
@@ -28,7 +28,7 @@ def load_data():
 df = load_data()
 
 # -------------------------------------------------------
-# FILTERS
+# Sidebar Filters
 # -------------------------------------------------------
 st.sidebar.header("🔍 Filters")
 branches = st.sidebar.multiselect("Select Branches", options=sorted(df["Branch Name"].dropna().unique()))
@@ -43,7 +43,7 @@ if feedback_types:
 filtered_df = filtered_df[(filtered_df["Date"] >= date_range[0]) & (filtered_df["Date"] <= date_range[-1])]
 
 # -------------------------------------------------------
-# HELPER FUNCTIONS
+# Helper functions
 # -------------------------------------------------------
 def shift_label(hour):
     if 7 <= hour < 12: return 'Breakfast'
@@ -53,13 +53,20 @@ def shift_label(hour):
 
 filtered_df['Shift'] = filtered_df['Hour'].apply(shift_label)
 
+shift_times = {
+    'Breakfast': '7 AM – 12 PM',
+    'Lunch': '12 PM – 5 PM',
+    'Dinner': '5 PM – 11 PM',
+    'Late Night': '11 PM – 7 AM'
+}
+
 # -------------------------------------------------------
-# TABS
+# Tabs
 # -------------------------------------------------------
 tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "📅 Time Trends", "⏰ Shift Insights", "💬 Complaint Themes"])
 
 # -------------------------------------------------------
-# TAB 1: OVERVIEW
+# TAB 1: Overview
 # -------------------------------------------------------
 with tab1:
     st.title("📊 Restaurant Complaints & Feedback Overview")
@@ -71,8 +78,8 @@ with tab1:
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Complaints", total_complaints)
-    c2.metric("Demoter %", f"{(demoters/total_complaints*100):.1f}%" if total_complaints else "0%")
-    c3.metric("Promoter %", f"{(promoters/total_complaints*100):.1f}%" if total_complaints else "0%")
+    c2.metric("Demoter %", f"{(demoters/total_complaints*100):.1f}%" if total_complaints else "0 %")
+    c3.metric("Promoter %", f"{(promoters/total_complaints*100):.1f}%" if total_complaints else "0 %")
     c4.metric("Unique Customers", unique_customers)
 
     st.subheader("📍 Complaints by Branch")
@@ -94,46 +101,72 @@ with tab1:
     st.plotly_chart(fig3, use_container_width=True)
 
 # -------------------------------------------------------
-# TAB 2: TIME TRENDS
+# TAB 2: Time Trends
 # -------------------------------------------------------
 with tab2:
     st.title("📅 Time-Based Complaint Analysis")
 
-    # Weekday vs Weekend
-    weekend_summary = filtered_df.groupby("IsWeekend")["Ticket number"].count().reset_index()
-    fig4 = px.bar(weekend_summary, x="IsWeekend", y="Ticket number", color="IsWeekend",
-                  text="Ticket number", title="📆 Weekday vs Weekend Complaints")
+    filtered_df['DayType'] = filtered_df['IsWeekend'].apply(lambda x: 'Weekend' if x else 'Weekday')
+
+    weekend_summary = filtered_df.groupby("DayType")["Ticket number"].count().reset_index()
+    fig4 = px.bar(
+        weekend_summary, x="DayType", y="Ticket number",
+        color="DayType", text="Ticket number",
+        color_discrete_sequence=["#FFB703", "#219EBC"],
+        title="📆 Weekday vs Weekend Complaints"
+    )
+    fig4.update_layout(xaxis_title="", yaxis_title="Number of Complaints")
     st.plotly_chart(fig4, use_container_width=True)
 
-    # Day of Week
     dow = filtered_df.groupby("DayOfWeek").size().reindex(
         ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
     ).reset_index(name="Count")
-    fig5 = px.line(dow, x="DayOfWeek", y="Count", markers=True, title="📈 Complaints by Day of Week")
+    fig5 = px.line(
+        dow, x="DayOfWeek", y="Count",
+        markers=True, line_shape="linear",
+        color_discrete_sequence=["#8ECAE6"],
+        title="📈 Complaints by Day of Week"
+    )
+    fig5.update_traces(marker=dict(size=8))
     st.plotly_chart(fig5, use_container_width=True)
 
-    # Weekly Trend
     weekly = filtered_df.groupby("Week").size().reset_index(name="Count")
-    fig6 = px.line(weekly, x="Week", y="Count", markers=True, title="🗓 Weekly Complaint Trend")
+    fig6 = px.line(
+        weekly, x="Week", y="Count",
+        markers=True, color_discrete_sequence=["#FB8500"],
+        title="🗓 Weekly Complaint Trend"
+    )
     st.plotly_chart(fig6, use_container_width=True)
 
 # -------------------------------------------------------
-# TAB 3: SHIFT INSIGHTS
+# TAB 3: Shift Insights
 # -------------------------------------------------------
 with tab3:
     st.title("⏰ Shift-Wise Insights")
 
     shift_summary = filtered_df.groupby("Shift")["Ticket number"].count().reset_index()
-    fig7 = px.pie(shift_summary, names="Shift", values="Ticket number", title="⏰ Complaints by Shift")
+    shift_summary["Shift (Time)"] = shift_summary["Shift"].apply(lambda s: f"{s} ({shift_times[s]})")
+
+    fig7 = px.pie(
+        shift_summary, names="Shift (Time)", values="Ticket number",
+        title="⏰ Complaints by Shift (with Time Slots)",
+        color_discrete_sequence=px.colors.qualitative.Pastel
+    )
     st.plotly_chart(fig7, use_container_width=True)
 
     sentiment_shift = filtered_df.groupby(["Shift", "Feedback Head"]).size().reset_index(name="Count")
-    fig8 = px.bar(sentiment_shift, x="Shift", y="Count", color="Feedback Head", barmode="group",
-                  title="😊 Feedback Sentiment by Shift")
+    sentiment_shift["Shift (Time)"] = sentiment_shift["Shift"].apply(lambda s: f"{s} ({shift_times[s]})")
+
+    fig8 = px.bar(
+        sentiment_shift, x="Shift (Time)", y="Count",
+        color="Feedback Head", barmode="group",
+        title="😊 Feedback Sentiment by Shift and Time Slot"
+    )
+    fig8.update_layout(xaxis_title="Shift (with Time Range)", yaxis_title="Complaint Count")
     st.plotly_chart(fig8, use_container_width=True)
 
 # -------------------------------------------------------
-# TAB 4: COMPLAINT THEMES
+# TAB 4: Complaint Themes and Insights
 # -------------------------------------------------------
 with tab4:
     st.title("💬 Complaint Themes & Insights")
@@ -146,28 +179,27 @@ with tab4:
         ax.axis("off")
         st.pyplot(fig)
 
-        # Keyword analysis for bullet insights
+        # --- Keyword insights
         words = re.findall(r'\b[a-zA-Z]{4,}\b', text.lower())
         common_words = Counter(words).most_common(20)
-        common_terms = [w for w, c in common_words]
+        common_terms = [w for w, _ in common_words]
         insights = []
-        if any(word in common_terms for word in ["cold", "food", "soggy", "undercooked"]):
+        if any(w in common_terms for w in ["cold","food","soggy","undercooked"]):
             insights.append("Frequent mentions of *cold* or *undercooked* food — kitchen temperature control issues.")
-        if any(word in common_terms for word in ["delay", "late", "slow", "time"]):
+        if any(w in common_terms for w in ["delay","late","slow","time"]):
             insights.append("Complaints about *delay* or *late service* — review order prep and dispatch timing.")
-        if any(word in common_terms for word in ["wrong", "missing", "order", "item"]):
+        if any(w in common_terms for w in ["wrong","missing","order","item"]):
             insights.append("Multiple mentions of *wrong* or *missing orders* — check packing and handoff accuracy.")
-        if any(word in common_terms for word in ["service", "respond", "not", "answer"]):
-            insights.append("Keywords like *service* and *respond* appear often — improve response time to customers.")
-        if any(word in common_terms for word in ["fries", "burger", "sauce", "drink"]):
-            insights.append("Product-level feedback spotted — e.g., *fries*, *burger*, *sauce*, *drink* quality concerns.")
+        if any(w in common_terms for w in ["service","respond","not","answer"]):
+            insights.append("Words like *service* and *respond* appear often — improve response time to customers.")
+        if any(w in common_terms for w in ["fries","burger","sauce","drink"]):
+            insights.append("Product-level feedback — *fries*, *burger*, *sauce*, *drink* quality concerns.")
         if not insights:
             insights.append("No strong recurring themes detected — complaints are dispersed.")
 
         st.markdown("### 🧠 Key Insights from Complaints")
         for point in insights:
             st.markdown(f"- {point}")
-
     else:
         st.info("No complaint descriptions available for word cloud.")
 
