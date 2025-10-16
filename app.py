@@ -446,28 +446,47 @@ with tabs[6]:
         "Closed At","First Response SLA","Resolution SLA","SLA Breach"
     ]
     present_cols = [c for c in key_cols if c in filtered.columns]
-    miss_df = pd.DataFrame({
-        "Field": present_cols,
-        "Missing %": [filtered[c].isna().mean()*100 for c in present_cols]
-    }).sort_values("Missing %", ascending=False)
-    fig_miss = px.bar(miss_df, x="Missing %", y="Field", orientation="h", title="🚧 Missingness by Field")
-    st.plotly_chart(fig_miss, use_container_width=True)
+    if present_cols:
+        miss_df = pd.DataFrame({
+            "Field": present_cols,
+            "Missing %": [filtered[c].isna().mean()*100 for c in present_cols]
+        }).sort_values("Missing %", ascending=False)
+        fig_miss = px.bar(miss_df, x="Missing %", y="Field", orientation="h", title="🚧 Missingness by Field")
+        st.plotly_chart(fig_miss, use_container_width=True)
+    else:
+        st.info("No key fields found for missingness check.")
 
     # Timestamp sanity checks
-    sanity = pd.DataFrame({"Rule":[],"Violations":[]})
+    sanity_rows = []
+
     def add_rule(name, mask):
-        nonlocal sanity
-        sanity = pd.concat([sanity, pd.DataFrame({"Rule":[name], "Violations":[int(mask.sum())]})], ignore_index=True)
+        # mask should be True where the rule is violated
+        try:
+            violations = int(mask.fillna(False).sum())
+        except Exception:
+            # fallback in case mask isn't a boolean Series
+            violations = int((mask.astype(bool)).fillna(False).sum())
+        sanity_rows.append({"Rule": name, "Violations": violations})
 
     if "Created At" in filtered.columns and "First Public Reply At" in filtered.columns:
-        add_rule("Created At ≤ First Public Reply At", (filtered["Created At"] > filtered["First Public Reply At"]))
+        add_rule("Created At ≤ First Public Reply At",
+                 filtered["Created At"] > filtered["First Public Reply At"])
+
     if "First Public Reply At" in filtered.columns and "Closed At" in filtered.columns:
-        add_rule("First Public Reply At ≤ Closed At", (filtered["First Public Reply At"] > filtered["Closed At"]))
+        add_rule("First Public Reply At ≤ Closed At",
+                 filtered["First Public Reply At"] > filtered["Closed At"])
+
     if "Created At" in filtered.columns and "Closed At" in filtered.columns:
-        add_rule("Created At ≤ Closed At", (filtered["Created At"] > filtered["Closed At"]))
+        add_rule("Created At ≤ Closed At",
+                 filtered["Created At"] > filtered["Closed At"])
+
+    sanity = pd.DataFrame(sanity_rows)
 
     if not sanity.empty:
         st.subheader("🧪 Timestamp Sanity Checks")
         st.dataframe(sanity, use_container_width=True)
+    else:
+        st.info("No timestamp rules evaluated (required columns missing).")
+
 
 st.caption("© 2025 Johnny & Jugnu | Built by Arbaz Mubasher — Streamlit + Plotly + pandas")
