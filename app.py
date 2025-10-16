@@ -9,7 +9,7 @@ import re
 # -------------------------------------------------------
 # ✅ Must be the first Streamlit command
 # -------------------------------------------------------
-st.set_page_config(page_title="Restaurant Complaints Dashboard", page_icon="🍔", layout="wide")
+st.set_page_config(page_title="Restaurant Responses Dashboard", page_icon="🍔", layout="wide")
 
 # -------------------------------------------------------
 # Load data
@@ -63,48 +63,51 @@ shift_times = {
 # -------------------------------------------------------
 # Tabs
 # -------------------------------------------------------
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "📅 Time Trends", "⏰ Shift Insights", "💬 Complaint Themes"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "📅 Time Trends", "⏰ Shift Insights", "💬 Response Themes"])
 
 # -------------------------------------------------------
 # TAB 1: Overview
 # -------------------------------------------------------
 with tab1:
-    st.title("📊 Restaurant Complaints & Feedback Overview")
+    st.title("📊 Restaurant Responses & Feedback Overview")
 
-    total_complaints = len(filtered_df)
+    total_responses = len(filtered_df)
     unique_customers = filtered_df["Customer CLI"].nunique()
     demoters = (filtered_df["Feedback Head"] == "Demoter").sum()
     promoters = (filtered_df["Feedback Head"] == "Promoter").sum()
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Complaints", total_complaints)
-    c2.metric("Demoter %", f"{(demoters/total_complaints*100):.1f}%" if total_complaints else "0 %")
-    c3.metric("Promoter %", f"{(promoters/total_complaints*100):.1f}%" if total_complaints else "0 %")
+    c1.metric("Total Responses", total_responses)
+    c2.metric("Demoter %", f"{(demoters/total_responses*100):.1f}%" if total_responses else "0 %")
+    c3.metric("Promoter %", f"{(promoters/total_responses*100):.1f}%" if total_responses else "0 %")
     c4.metric("Unique Customers", unique_customers)
 
-    st.subheader("📍 Complaints by Branch")
+    st.subheader("📍 Responses by Branch")
     branch_counts = filtered_df["Branch Name"].value_counts().reset_index()
     branch_counts.columns = ["Branch", "Count"]
-    fig1 = px.bar(branch_counts, x="Count", y="Branch", orientation="h", color="Branch", text="Count")
+    fig1 = px.bar(branch_counts, x="Count", y="Branch", orientation="h", color="Branch", text="Count",
+                  title="📍 Responses by Branch")
     st.plotly_chart(fig1, use_container_width=True)
 
-    st.subheader("🍔 Top Complaint Categories (Tags)")
+    st.subheader("🍔 Top Response Categories (Tags)")
     if "Tags" in filtered_df.columns:
         tag_counts = filtered_df["Tags"].value_counts().head(10).reset_index()
         tag_counts.columns = ["Tag", "Count"]
-        fig2 = px.bar(tag_counts, x="Count", y="Tag", orientation="h", color="Tag", text="Count")
+        fig2 = px.bar(tag_counts, x="Count", y="Tag", orientation="h", color="Tag", text="Count",
+                      title="🍔 Top Response Categories (Tags)")
         st.plotly_chart(fig2, use_container_width=True)
 
     st.subheader("😊 Feedback Sentiment by Branch")
     sentiment = filtered_df.groupby(["Branch Name", "Feedback Head"]).size().reset_index(name="Count")
-    fig3 = px.bar(sentiment, x="Branch Name", y="Count", color="Feedback Head", barmode="stack")
+    fig3 = px.bar(sentiment, x="Branch Name", y="Count", color="Feedback Head", barmode="stack",
+                  title="😊 Feedback Sentiment by Branch")
     st.plotly_chart(fig3, use_container_width=True)
 
 # -------------------------------------------------------
 # TAB 2: Time Trends
 # -------------------------------------------------------
 with tab2:
-    st.title("📅 Time-Based Complaint Analysis")
+    st.title("📅 Time-Based Response Analysis")
 
     filtered_df['DayType'] = filtered_df['IsWeekend'].apply(lambda x: 'Weekend' if x else 'Weekday')
 
@@ -113,9 +116,9 @@ with tab2:
         weekend_summary, x="DayType", y="Ticket number",
         color="DayType", text="Ticket number",
         color_discrete_sequence=["#FFB703", "#219EBC"],
-        title="📆 Weekday vs Weekend Complaints"
+        title="📆 Weekday vs Weekend Responses"
     )
-    fig4.update_layout(xaxis_title="", yaxis_title="Number of Complaints")
+    fig4.update_layout(xaxis_title="", yaxis_title="Number of Responses")
     st.plotly_chart(fig4, use_container_width=True)
 
     dow = filtered_df.groupby("DayOfWeek").size().reindex(
@@ -125,7 +128,7 @@ with tab2:
         dow, x="DayOfWeek", y="Count",
         markers=True, line_shape="linear",
         color_discrete_sequence=["#8ECAE6"],
-        title="📈 Complaints by Day of Week"
+        title="📈 Responses by Day of Week"
     )
     fig5.update_traces(marker=dict(size=8))
     st.plotly_chart(fig5, use_container_width=True)
@@ -134,7 +137,7 @@ with tab2:
     fig6 = px.line(
         weekly, x="Week", y="Count",
         markers=True, color_discrete_sequence=["#FB8500"],
-        title="🗓 Weekly Complaint Trend"
+        title="🗓 Weekly Response Trend"
     )
     st.plotly_chart(fig6, use_container_width=True)
 
@@ -149,7 +152,7 @@ with tab3:
 
     fig7 = px.pie(
         shift_summary, names="Shift (Time)", values="Ticket number",
-        title="⏰ Complaints by Shift (with Time Slots)",
+        title="⏰ Responses by Shift (with Time Slots)",
         color_discrete_sequence=px.colors.qualitative.Pastel
     )
     st.plotly_chart(fig7, use_container_width=True)
@@ -162,14 +165,14 @@ with tab3:
         color="Feedback Head", barmode="group",
         title="😊 Feedback Sentiment by Shift and Time Slot"
     )
-    fig8.update_layout(xaxis_title="Shift (with Time Range)", yaxis_title="Complaint Count")
+    fig8.update_layout(xaxis_title="Shift (with Time Range)", yaxis_title="Response Count")
     st.plotly_chart(fig8, use_container_width=True)
 
 # -------------------------------------------------------
-# TAB 4: Complaint Themes and Insights
+# TAB 4: Response Themes and Insights
 # -------------------------------------------------------
 with tab4:
-    st.title("💬 Complaint Themes & Insights")
+    st.title("💬 Response Themes & Insights")
 
     text = " ".join(str(desc) for desc in filtered_df["Description"].dropna())
     if text.strip():
@@ -187,20 +190,20 @@ with tab4:
         if any(w in common_terms for w in ["cold","food","soggy","undercooked"]):
             insights.append("Frequent mentions of *cold* or *undercooked* food — kitchen temperature control issues.")
         if any(w in common_terms for w in ["delay","late","slow","time"]):
-            insights.append("Complaints about *delay* or *late service* — review order prep and dispatch timing.")
+            insights.append("Mentions of *delay* or *late service* — review prep and dispatch timing.")
         if any(w in common_terms for w in ["wrong","missing","order","item"]):
-            insights.append("Multiple mentions of *wrong* or *missing orders* — check packing and handoff accuracy.")
+            insights.append("Mentions of *wrong* or *missing orders* — check packing and handoff accuracy.")
         if any(w in common_terms for w in ["service","respond","not","answer"]):
-            insights.append("Words like *service* and *respond* appear often — improve response time to customers.")
+            insights.append("Frequent *service* or *response* issues — review customer support handling.")
         if any(w in common_terms for w in ["fries","burger","sauce","drink"]):
-            insights.append("Product-level feedback — *fries*, *burger*, *sauce*, *drink* quality concerns.")
+            insights.append("Product-level feedback on *fries*, *burger*, *sauce*, *drink* quality.")
         if not insights:
-            insights.append("No strong recurring themes detected — complaints are dispersed.")
+            insights.append("No strong recurring themes detected — responses are dispersed.")
 
-        st.markdown("### 🧠 Key Insights from Complaints")
+        st.markdown("### 🧠 Key Insights from Responses")
         for point in insights:
             st.markdown(f"- {point}")
     else:
-        st.info("No complaint descriptions available for word cloud.")
+        st.info("No response descriptions available for word cloud.")
 
 st.caption("© 2025 Johnny & Jugnu | Built by Arbaz Mubasher")
