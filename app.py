@@ -93,11 +93,18 @@ def prepare_data(raw: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
     # Derived time columns
-    df["Date"] = pd.to_datetime(df.get("Created At"), errors="coerce").dt.date
-    df["Hour"] = pd.to_datetime(df.get("Created At"), errors="coerce").dt.hour
-    df["DayOfWeek"] = pd.to_datetime(df.get("Created At"), errors="coerce").dt.day_name()
-    df["Week"] = pd.to_datetime(df.get("Created At"), errors="coerce").dt.strftime("%Y-%U")
+    created = pd.to_datetime(df.get("Created At"), errors="coerce")
+    df["Date"] = created.dt.date
+    df["Hour"] = created.dt.hour
+    df["DayOfWeek"] = created.dt.day_name()
     df["IsWeekend"] = df["DayOfWeek"].isin(["Saturday", "Sunday"])
+
+    # ✅ ISO weeks + true datetime "WeekStart" (Monday)
+    iso = created.dt.isocalendar()  # DataFrame-like (year, week, day)
+    df["ISO_Year"] = iso.year
+    df["ISO_Week"] = iso.week
+    # WeekStart = CreatedAt - weekday offset (Mon=0)
+    df["WeekStart"] = (created - pd.to_timedelta(created.dt.weekday, unit="D")).dt.normalize()
 
     # Shifts
     def shift_label(h):
@@ -236,6 +243,7 @@ with tabs[0]:
 with tabs[1]:
     st.title("🗓️ Time Intelligence")
 
+    # Weekday vs Weekend (with Demoter % line)
     if set(["IsWeekend", "Feedback Head", "Ticket number"]).issubset(filtered.columns):
         tmp = filtered.copy()
         tmp["DayType"] = tmp["IsWeekend"].apply(lambda x: "Weekend" if x else "Weekday")
@@ -256,22 +264,41 @@ with tabs[1]:
         )
         st.plotly_chart(fig_combo, use_container_width=True)
 
+    # Day of Week profile
     if "DayOfWeek" in filtered.columns:
         order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
         dow = filtered.groupby("DayOfWeek").size().reindex(order).reset_index(name="Responses")
         fig_dow = px.line(dow, x="DayOfWeek", y="Responses", markers=True, title="📈 Responses by Day of Week")
         st.plotly_chart(fig_dow, use_container_width=True)
 
+    # Intraday heatmap (Hour x DayOfWeek)
     if set(["Hour", "DayOfWeek", "Ticket number"]).issubset(filtered.columns):
         intraday = filtered.dropna(subset=["Hour"]).copy()
-        intraday_pivot = intraday.pivot_table(index="Hour", columns="DayOfWeek", values="Ticket number", aggfunc="count", fill_value=0)
+        intraday_pivot = intraday.pivot_table(index="Hour", columns="DayOfWeek",
+                                              values="Ticket number", aggfunc="count", fill_value=0)
         intraday_pivot = intraday_pivot.reindex(columns=["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"], fill_value=0)
         fig_heat = px.imshow(intraday_pivot, color_continuous_scale="YlOrRd", title="🔥 Intraday Responses Heatmap (Hour × Day)")
         st.plotly_chart(fig_heat, use_container_width=True)
 
-    if set(["Week", "Ticket number"]).issubset(filtered.columns):
-        weekly = filtered.groupby("Week").size().reset_index(name="Responses")
-        fig_weekly = px.line(weekly, x="Week", y="Responses", markers=True, title="🗓 Weekly Response Trend")
+    # ✅ Weekly Response Trend using ISO weeks + real date axis
+    if set(["WeekStart", "ISO_Year", "ISO_Week", "Ticket number"]).issubset(filtered.columns):
+        wk = (filtered
+              .dropna(subset=["WeekStart"])
+              .groupby(["ISO_Year", "ISO_Week", "WeekStart"])
+              .size()
+              .reset_index(name="Responses")
+              .sort_values("WeekStart"))
+
+        wk["WeekLabel"] = wk["ISO_Year"].astype(str) + "-W" + wk["ISO_Week"].astype(str).str.zfill(2)
+
+        fig_weekly = px.line(
+            wk, x="WeekStart", y="Responses", markers=True,
+            hover_data={"WeekStart": False, "WeekLabel": True, "ISO_Year": False, "ISO_Week": False}
+        )
+        fig_weekly.update_layout(title="🗓 Weekly Response Trend (ISO weeks, Monday start)",
+                                 xaxis_title="Week (Mon start)", yaxis_title="Responses")
+        # If you prefer ISO labels as ticks, uncomment:
+        # fig_weekly.update_xaxes(tickmode="array", tickvals=wk["WeekStart"], ticktext=wk["WeekLabel"])
         st.plotly_chart(fig_weekly, use_container_width=True)
 
 # ======================================================
@@ -308,13 +335,15 @@ with tabs[2]:
     # SLA heatmaps (by Branch and by Shift)
     if "SLA Breach" in filtered.columns:
         if "Branch Name" in filtered.columns:
-            sla_branch = filtered.pivot_table(index="Branch Name", values="SLA Breach", aggfunc=lambda s: np.mean(s.fillna(False).astype(float))*100)
+            sla_branch = filtered.pivot_table(index="Branch Name", values="SLA Breach",
+                                              aggfunc=lambda s: np.mean(s.fillna(False).astype(float))*100)
             fig_sla_b = px.imshow(sla_branch.sort_values("SLA Breach"), color_continuous_scale="Reds",
                                   title="🚨 SLA Breach % by Branch", text_auto=".1f")
             st.plotly_chart(fig_sla_b, use_container_width=True)
 
         if "Shift" in filtered.columns:
-            sla_shift = filtered.pivot_table(index="Shift", values="SLA Breach", aggfunc=lambda s: np.mean(s.fillna(False).astype(float))*100)
+            sla_shift = filtered.pivot_table(index="Shift", values="SLA Breach",
+                                             aggfunc=lambda s: np.mean(s.fillna(False).astype(float))*100)
             sla_shift = sla_shift.reindex(["Breakfast","Lunch","Dinner","Late Night"]).fillna(0)
             fig_sla_s = px.imshow(sla_shift, color_continuous_scale="Reds", title="🚨 SLA Breach % by Shift", text_auto=".1f")
             st.plotly_chart(fig_sla_s, use_container_width=True)
@@ -338,7 +367,8 @@ with tabs[3]:
         top_tag_values = filtered["Tags"].value_counts().head(topN).index
         tag_branch = filtered[filtered["Tags"].isin(top_tag_values)]
         if not tag_branch.empty:
-            tb = tag_branch.pivot_table(index="Tags", columns="Branch Name", values="Ticket number", aggfunc="count", fill_value=0)
+            tb = tag_branch.pivot_table(index="Tags", columns="Branch Name", values="Ticket number",
+                                        aggfunc="count", fill_value=0)
             fig_tb = px.imshow(tb, color_continuous_scale="YlGnBu", title=f"Tag × Branch Heatmap (Top {topN} Tags)")
             st.plotly_chart(fig_tb, use_container_width=True)
 
@@ -346,7 +376,8 @@ with tabs[3]:
     if set(["Tags","Shift","Ticket number"]).issubset(filtered.columns):
         tag_shift = filtered[filtered["Tags"].isin(top_tag_values)]
         if not tag_shift.empty:
-            ts = tag_shift.pivot_table(index="Tags", columns="Shift", values="Ticket number", aggfunc="count", fill_value=0)
+            ts = tag_shift.pivot_table(index="Tags", columns="Shift", values="Ticket number",
+                                       aggfunc="count", fill_value=0)
             ts = ts.reindex(columns=["Breakfast","Lunch","Dinner","Late Night"])
             fig_ts = px.imshow(ts, color_continuous_scale="YlOrRd", title=f"Tag × Shift Heatmap (Top {topN} Tags)")
             st.plotly_chart(fig_ts, use_container_width=True)
@@ -452,7 +483,7 @@ with tabs[4]:
         agent_agg = filtered.groupby("Team Member").agg(
             Responses=("Ticket number","count"),
             Median_TTR=("TTR_min","median"),
-            DemoterRate=("Feedback Head", lambda s: (s=="Demoter").mean()*100) if "Feedback Head" in filtered.columns else ("Feedback Head", "size")
+            DemoterRate=("Feedback Head", lambda s: (s=="Demoter").mean()*100) if "Feedback Head" in filtered.columns else ("Ticket number","count")
         ).reset_index()
         agent_agg = agent_agg[agent_agg["Responses"] > 0]
         fig_agent = px.scatter(agent_agg, x="Responses", y="Median_TTR", color="DemoterRate",
