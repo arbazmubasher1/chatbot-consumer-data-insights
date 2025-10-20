@@ -205,9 +205,11 @@ if sel_shifts and "Shift" in filtered.columns:
 if "Date" in filtered.columns and len(sel_dates) == 2:
     filtered = filtered[(filtered["Date"] >= sel_dates[0]) & (filtered["Date"] <= sel_dates[1])]
 
-# Remove "Not Responding" entries globally
-if "Tags" in filtered.columns:
-    filtered = filtered[~filtered["Tags"].str.contains(r"\bNot Responding\b", case=False, na=False)]
+# Reclassify Demoter → Neutral when Tags contain "Not Responding"
+if set(["Tags", "Feedback Head"]).issubset(filtered.columns):
+    nr_mask = filtered["Tags"].str.contains(r"\bNot Responding\b", case=False, na=False)
+    demoter_mask = filtered["Feedback Head"].astype(str).str.casefold().eq("demoter")
+    filtered.loc[nr_mask & demoter_mask, "Feedback Head"] = "Neutral"
 
 # =========================
 # Helpers
