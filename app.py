@@ -267,7 +267,7 @@ with tabs[0]:
     c7.metric("Reopen %", f"{pct(reopened, total_responses):.1f}%")
 
     if "Branch Name" in filtered.columns:
-        st.subheader("📍 Responses by Branch")
+        st.subheader("Responses by Branch")
         branch_counts = filtered["Branch Name"].value_counts().reset_index()
         branch_counts.columns = ["Branch", "Responses"]
         fig = px.bar(branch_counts, x="Responses", y="Branch", orientation="h", text="Responses",
@@ -275,7 +275,7 @@ with tabs[0]:
         st.plotly_chart(fig, use_container_width=True)
 
     if "Tags" in filtered.columns:
-        st.subheader("🍔 Top Response Categories (Tags)")
+        st.subheader("Top Response Categories (Tags)")
         top_tags = filtered["Tags"].value_counts().head(15).reset_index()
         top_tags.columns = ["Tag", "Responses"]
         fig2 = px.bar(top_tags, x="Responses", y="Tag", orientation="h", text="Responses",
@@ -283,7 +283,7 @@ with tabs[0]:
         st.plotly_chart(fig2, use_container_width=True)
 
     if set(["Branch Name", "Feedback Head"]).issubset(filtered.columns):
-        st.subheader("😊 Feedback Sentiment by Branch")
+        st.subheader("Feedback Sentiment by Branch")
         sentiment = filtered.groupby(["Branch Name", "Feedback Head"]).size().reset_index(name="Count")
         fig3 = px.bar(sentiment, x="Branch Name", y="Count", color="Feedback Head", barmode="stack",
                       title="Feedback Sentiment by Branch")
