@@ -11,6 +11,7 @@
 # 7) Data Quality
 # 8) Classification Audit
 # -------------------------------------------------------
+
 import os
 import io
 import re
@@ -58,7 +59,7 @@ def classify_spark(tag: str) -> str:
                             "wrong product", "wrong sauce", "product missed"]):
         return "SPARK: Accuracy"
 
-    # Relationship (CX / delivery / others)
+    # Relationship
     if any(k in t for k in ["service", "remarks", "compensated", "delivery", "others", "not responding"]):
         return "SPARK: Relationship"
 
@@ -206,9 +207,9 @@ if "Date" in filtered.columns and len(sel_dates) == 2:
     filtered = filtered[(filtered["Date"] >= sel_dates[0]) & (filtered["Date"] <= sel_dates[1])]
 
 # =========================
-# Exclusion of Demoters with "Not Responding" in Tags
+# Exclusion of Demoters with "Not Responding" in Tags (applies to ALL analyses)
 # =========================
-pre_analysis_df = filtered.copy()  # snapshot before exclusions (for audit only)
+pre_analysis_df = filtered.copy()  # snapshot before exclusions (for audit)
 
 excluded_mask = pd.Series(False, index=filtered.index)
 if set(["Tags", "Feedback Head"]).issubset(filtered.columns):
@@ -217,60 +218,14 @@ if set(["Tags", "Feedback Head"]).issubset(filtered.columns):
     excluded_mask = nr_mask & demoter_mask
 
 excluded_count = int(excluded_mask.sum())
-filtered = filtered[~excluded_mask].copy()  # remove those rows from all downstream analyses
+filtered = filtered[~excluded_mask].copy()
 
-# Keep an audit payload for the tab
+# Save audit payload for the tab
 audit_payload = {
-    "pre": pre_analysis_df,        # before exclusion
-    "post": filtered.copy(),       # after exclusion
-    "mask": excluded_mask,         # which rows were excluded
-    "count": excluded_count,
-}
-
-pre_classification = filtered.copy()  # snapshot before we fix labels
-
-misclassified_mask = pd.Series(False, index=filtered.index)
-if set(["Tags", "Feedback Head"]).issubset(filtered.columns):
-    nr_mask = filtered["Tags"].str.contains(r"\bNot Responding\b", case=False, na=False)
-    demoter_mask = filtered["Feedback Head"].astype(str).str.casefold().eq("demoter")
-    misclassified_mask = nr_mask & demoter_mask
-
-# Audit metrics (before fix)
-misclassified_count = int(misclassified_mask.sum())
-total_demoters_pre = int((pre_classification["Feedback Head"] == "Demoter").sum()) if "Feedback Head" in pre_classification.columns else 0
-share_of_demoters = (misclassified_count / total_demoters_pre * 100.0) if total_demoters_pre else 0.0
-
-# NPS before fix
-def compute_nps(df_part: pd.DataFrame) -> float:
-    if "Feedback Head" not in df_part.columns or df_part.empty:
-        return 0.0
-    total = len(df_part)
-    if total == 0:
-        return 0.0
-    promoters = (df_part["Feedback Head"] == "Promoter").sum()
-    demoters = (df_part["Feedback Head"] == "Demoter").sum()
-    return (promoters/total*100.0) - (demoters/total*100.0)
-
-nps_before_fix = compute_nps(pre_classification)
-
-# Apply the fix: reclassify Demoter → Neutral when Tags contain "Not Responding"
-if misclassified_count > 0:
-    filtered.loc[misclassified_mask, "Feedback Head"] = "Neutral"
-
-# NPS after fix
-nps_after_fix = compute_nps(filtered)
-nps_delta = nps_after_fix - nps_before_fix
-
-audit_payload = {
-    "pre": pre_classification,
+    "pre": pre_analysis_df,
     "post": filtered.copy(),
-    "mask": misclassified_mask,
-    "count": misclassified_count,
-    "demoters_pre": total_demoters_pre,
-    "share": share_of_demoters,
-    "nps_before": nps_before_fix,
-    "nps_after": nps_after_fix,
-    "nps_delta": nps_delta,
+    "mask": excluded_mask,
+    "count": excluded_count,
 }
 
 # =========================
@@ -281,6 +236,17 @@ def safe_count(frame: pd.DataFrame) -> int:
 
 def pct(n: float, d: float) -> float:
     return (100.0 * n / d) if d else 0.0
+
+def compute_nps(df_part: pd.DataFrame) -> float:
+    # Canonical NPS: percentages over ALL responses (Promoter + Neutral + Demoter)
+    if "Feedback Head" not in df_part.columns or df_part.empty:
+        return 0.0
+    p = (df_part["Feedback Head"] == "Promoter").sum()
+    d = (df_part["Feedback Head"] == "Demoter").sum()
+    base = len(df_part)
+    if base == 0:
+        return 0.0
+    return (p / base * 100.0) - (d / base * 100.0)
 
 # =========================
 # Tabs
@@ -303,7 +269,6 @@ with tabs[0]:
     st.title("Responses & Feedback Overview")
 
     total_responses = safe_count(filtered)
-    unique_customers = filtered["Customer CLI"].nunique() if "Customer CLI" in filtered.columns else 0
     demoters = int((filtered["Feedback Head"] == "Demoter").sum()) if "Feedback Head" in filtered.columns else 0
     promoters = int((filtered["Feedback Head"] == "Promoter").sum()) if "Feedback Head" in filtered.columns else 0
     neutrals = int((filtered["Feedback Head"] == "Neutral").sum()) if "Feedback Head" in filtered.columns else 0
@@ -533,7 +498,7 @@ with tabs[3]:
 
     # Tag × Shift heatmap
     if set(["Tags","Shift","Ticket number"]).issubset(filtered.columns):
-        tag_shift = filtered[filtered["Tags"].isin(top_tag_values)]
+        tag_shift = filtered[filtered["Tags"].isin(topN and top_tag_values)]
         if not tag_shift.empty:
             ts = tag_shift.pivot_table(index="Tags", columns="Shift", values="Ticket number",
                                        aggfunc="count", fill_value=0)
@@ -543,153 +508,128 @@ with tabs[3]:
 
     # Sentiment by Tag
     if set(["Tags","Feedback Head"]).issubset(filtered.columns):
-        sent_tag = filtered[filtered["Tags"].isin(top_tag_values)].groupby(["Tags","Feedback Head"]).size().reset_index(name="Count")
+        sent_tag = filtered[filtered["Tags"].isin(topN and top_tag_values)].groupby(["Tags","Feedback Head"]).size().reset_index(name="Count")
         if not sent_tag.empty:
             fig_st = px.bar(sent_tag, y="Tags", x="Count", color="Feedback Head", orientation="h", barmode="relative",
                             title="Sentiment Breakdown by Tag", text="Count")
             st.plotly_chart(fig_st, use_container_width=True)
 
-# -----------------------------
-# Text Mining on Descriptions (no sklearn)
-# -----------------------------
-st.subheader("Text Mining on Descriptions")
+    # -----------------------------
+    # Text Mining on Descriptions (no sklearn)
+    # -----------------------------
+    st.subheader("Text Mining on Descriptions")
 
-def simple_tokenize(s: str) -> list[str]:
-    # alphabetic tokens len>=2, lowercased
-    return re.findall(r"\b[a-z][a-z]+\b", s.lower())
+    def simple_tokenize(s: str) -> list[str]:
+        return re.findall(r"\b[a-z][a-z]+\b", s.lower())
 
-# english stopwords (trimmed) + domain stopwords you can extend any time
-EN_SW = {
-    # english-ish
-    "a","an","and","the","or","for","to","of","in","on","at","by","from","with","without","into","over","under",
-    "is","are","was","were","am","be","been","being","as","it","this","that","these","those",
-    "i","we","you","he","she","they","them","his","her","their","our","my","your",
-    "do","did","does","done","doing","have","has","had","having","get","got","make","made","give","given",
-    "can","could","may","might","should","would","will","shall","not","no","yes",
-    "very","more","most","less","least","much","many","some","any","all","each","every","both","few","several",
-    "than","then","there","here","also","just","now","still","again","even","ever","never"
-}
+    EN_SW = {
+        "a","an","and","the","or","for","to","of","in","on","at","by","from","with","without","into","over","under",
+        "is","are","was","were","am","be","been","being","as","it","this","that","these","those",
+        "i","we","you","he","she","they","them","his","her","their","our","my","your",
+        "do","did","does","done","doing","have","has","had","having","get","got","make","made","give","given",
+        "can","could","may","might","should","would","will","shall","not","no","yes",
+        "very","more","most","less","least","much","many","some","any","all","each","every","both","few","several",
+        "than","then","there","here","also","just","now","still","again","even","ever","never"
+    }
 
-DOMAIN_SW = {
-    # generic CX boilerplate and low-signal nouns/verbs
-    "customer","customers","per","order","orders","food","items","item","product","products",
-    "restaurant","branch","place","service","services","system","issue","issues","team","call","called","says","said","told",
-    "minutes","minute","hour","hours","today","yesterday","tomorrow","overall","option","available","provided",
-    "number","phone","rider","delivery","behavior","remarks","standard","kindly","please",
-    # menu fillers (keep the specific faults like cold/undercooked, drop generic nouns)
-    "wrap","wraps","burger","burgers","fries","drink","drinks","dip","sauce","saucy","patty","size",
-}
+    DOMAIN_SW = {
+        "customer","customers","per","order","orders","food","items","item","product","products",
+        "restaurant","branch","place","service","services","system","issue","issues","team","call","called","says","said","told",
+        "minutes","minute","hour","hours","today","yesterday","tomorrow","overall","option","available","provided",
+        "number","phone","rider","delivery","behavior","remarks","standard","kindly","please",
+        "wrap","wraps","burger","burgers","fries","drink","drinks","dip","sauce","saucy","patty","size"
+    }
 
-STOP = EN_SW | DOMAIN_SW
+    STOP = EN_SW | DOMAIN_SW
+    PHRASE_BLACKLIST = {"per customer","the customer","customer the","per the","call back","call again"}
 
-# phrases we never want
-PHRASE_BLACKLIST = {
-    "per customer","the customer","customer the","per the","call back","call again"
-}
+    def gen_ngrams(tokens: list[str], n: int) -> list[str]:
+        return [" ".join(tokens[i:i+n]) for i in range(len(tokens)-n+1)]
 
-def gen_ngrams(tokens: list[str], n: int) -> list[str]:
-    return [" ".join(tokens[i:i+n]) for i in range(len(tokens)-n+1)]
+    def phrase_ok(p: str) -> bool:
+        if p in PHRASE_BLACKLIST:
+            return False
+        terms = p.split()
+        if terms[0] in STOP or terms[-1] in STOP:
+            return False
+        if all(t in STOP for t in terms):
+            return False
+        if any(len(t) <= 2 for t in terms):
+            return False
+        return True
 
-def phrase_ok(p: str) -> bool:
-    if p in PHRASE_BLACKLIST:
-        return False
-    terms = p.split()
-    # drop if starts/ends with stopword
-    if terms[0] in STOP or terms[-1] in STOP:
-        return False
-    # drop if all tokens are stopwords
-    if all(t in STOP for t in terms):
-        return False
-    # drop if any token is 1-char (already filtered by regex, but safe)
-    if any(len(t) <= 2 for t in terms):
-        return False
-    return True
+    def top_ngrams_from_texts(texts: list[str], n: int, topk: int = 20, min_count: int = 2) -> pd.DataFrame:
+        all_ngrams = []
+        for t in texts:
+            toks = [tok for tok in simple_tokenize(t) if tok not in STOP]
+            if len(toks) < n:
+                continue
+            ngrams = [g for g in gen_ngrams(toks, n) if phrase_ok(g)]
+            all_ngrams.extend(ngrams)
+        if not all_ngrams:
+            return pd.DataFrame(columns=["ngram","count"])
+        cnt = Counter(all_ngrams)
+        df_ng = pd.DataFrame(cnt.items(), columns=["ngram","count"])
+        df_ng = df_ng[df_ng["count"] >= min_count]
+        df_ng = df_ng.sort_values("count", ascending=False).head(topk).reset_index(drop=True)
+        return df_ng
 
-def top_ngrams_from_texts(texts: list[str], n: int, topk: int = 20, min_count: int = 2, max_share: float = 0.8) -> pd.DataFrame:
-    # tokenize each text, remove stopwords, build ngrams
-    all_ngrams = []
-    doc_count = len(texts)
-    if doc_count == 0:
-        return pd.DataFrame(columns=["ngram","count"])
-    for t in texts:
-        toks = [t for t in simple_tokenize(t) if t not in STOP]
-        if len(toks) < n:
-            continue
-        ngrams = [g for g in gen_ngrams(toks, n) if phrase_ok(g)]
-        all_ngrams.extend(ngrams)
+    if "Description" in filtered.columns:
+        texts = filtered["Description"].dropna().astype(str).tolist()
+    else:
+        texts = []
 
-    if not all_ngrams:
-        return pd.DataFrame(columns=["ngram","count"])
+    if len(texts) == 0:
+        st.info("No response descriptions found for text analysis.")
+    else:
+        top_bi  = top_ngrams_from_texts(texts, n=2, topk=20, min_count=2)
+        top_tri = top_ngrams_from_texts(texts, n=3, topk=20, min_count=2)
 
-    # counts
-    cnt = Counter(all_ngrams)
-    # drop extremely common boilerplate ngrams that appear in too many docs
-    # approximate document frequency by counting unique n-grams per text
-    # fast heuristic: if an n-gram contains a token that appears in > max_share texts, suppress; else keep.
-    # fallback: just keep min_count filter.
-    df = pd.DataFrame(cnt.items(), columns=["ngram","count"])
-    df = df[df["count"] >= min_count]
-    df = df.sort_values("count", ascending=False).head(topk).reset_index(drop=True)
-    return df
+        wc_text_parts = []
+        for df_ng in (top_bi, top_tri):
+            for p, c in zip(df_ng["ngram"], df_ng["count"]):
+                wc_text_parts.extend([p] * int(c))
+        wc_text = " ".join(wc_text_parts)
+        if wc_text.strip():
+            wc = WordCloud(width=1100, height=360, background_color="white").generate(wc_text)
+            fig_wc, ax = plt.subplots(figsize=(12, 4))
+            ax.imshow(wc, interpolation="bilinear")
+            ax.axis("off")
+            st.pyplot(fig_wc)
 
-if "Description" in filtered.columns:
-    texts = filtered["Description"].dropna().astype(str).tolist()
-else:
-    texts = []
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("Top Bigrams")
+            st.dataframe(top_bi, use_container_width=True)
+            if not top_bi.empty:
+                fig_bi = px.bar(top_bi.head(15), x="count", y="ngram", orientation="h", title="Top Bigrams")
+                st.plotly_chart(fig_bi, use_container_width=True)
+        with c2:
+            st.markdown("Top Trigrams")
+            st.dataframe(top_tri, use_container_width=True)
+            if not top_tri.empty:
+                fig_tri = px.bar(top_tri.head(15), x="count", y="ngram", orientation="h", title="Top Trigrams")
+                st.plotly_chart(fig_tri, use_container_width=True)
 
-if len(texts) == 0:
-    st.info("No response descriptions found for text analysis.")
-else:
-    top_bi  = top_ngrams_from_texts(texts, n=2, topk=20, min_count=2)
-    top_tri = top_ngrams_from_texts(texts, n=3, topk=20, min_count=2)
+        def phrases_have(df_: pd.DataFrame, keywords: list[str]) -> bool:
+            joined = " ".join(df_["ngram"].tolist())
+            return any(k in joined for k in keywords)
 
-    # Wordcloud using cleaned phrases, weighted by counts
-    wc_text_parts = []
-    for df_ng in (top_bi, top_tri):
-        for p, c in zip(df_ng["ngram"], df_ng["count"]):
-            wc_text_parts.extend([p] * int(c))
-    wc_text = " ".join(wc_text_parts)
-    if wc_text.strip():
-        wc = WordCloud(width=1100, height=360, background_color="white").generate(wc_text)
-        fig_wc, ax = plt.subplots(figsize=(12, 4))
-        ax.imshow(wc, interpolation="bilinear")
-        ax.axis("off")
-        st.pyplot(fig_wc)
+        insights = []
+        if phrases_have(top_bi, ["cold","soggy","undercooked","overcooked"]) or phrases_have(top_tri, ["undercooked chicken","food cold"]):
+            insights.append("Temperature/cook issues are frequent; audit hot-hold, cook times, and pass checks.")
+        if phrases_have(top_bi, ["time above","time between","late","delay"]) or phrases_have(top_tri, ["order was late"]):
+            insights.append("Speed of service issues present; rebalance staffing and rider timing at peaks.")
+        if phrases_have(top_bi, ["wrong addons","fries missed","dip missed","wrong sauce","wrong product","missing addons"]):
+            insights.append("Accuracy defects present; enforce pack-out checklists and dip/fries scan step.")
+        if phrases_have(top_bi, ["foreign object","dirty","hygiene"]):
+            insights.append("Cleanliness flags exist; reinforce station hygiene SOPs.")
+        if not insights:
+            insights.append("No concentrated themes after cleaning; phrases are distributed.")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("Top Bigrams")
-        st.dataframe(top_bi, use_container_width=True)
-        if not top_bi.empty:
-            fig_bi = px.bar(top_bi.head(15), x="count", y="ngram", orientation="h", title="Top Bigrams")
-            st.plotly_chart(fig_bi, use_container_width=True)
-    with c2:
-        st.markdown("Top Trigrams")
-        st.dataframe(top_tri, use_container_width=True)
-        if not top_tri.empty:
-            fig_tri = px.bar(top_tri.head(15), x="count", y="ngram", orientation="h", title="Top Trigrams")
-            st.plotly_chart(fig_tri, use_container_width=True)
-
-    # Quick insights based on cleaner phrases
-    def phrases_have(df_: pd.DataFrame, keywords: list[str]) -> bool:
-        joined = " ".join(df_["ngram"].tolist())
-        return any(k in joined for k in keywords)
-
-    insights = []
-    if phrases_have(top_bi, ["cold","soggy","undercooked","overcooked"]) or phrases_have(top_tri, ["undercooked chicken","food cold"]):
-        insights.append("Temperature/cook issues are frequent; audit hot-hold, cook times, and pass checks.")
-    if phrases_have(top_bi, ["time above","time between","late","delay"]) or phrases_have(top_tri, ["order was late"]):
-        insights.append("Speed of service issues present; rebalance staffing and rider timing at peaks.")
-    if phrases_have(top_bi, ["wrong addons","fries missed","dip missed","wrong sauce","wrong product","missing addons"]):
-        insights.append("Accuracy defects present; enforce pack-out checklists and dip/fries scan step.")
-    if phrases_have(top_bi, ["foreign object","dirty","hygiene"]):
-        insights.append("Cleanliness flags exist; reinforce station hygiene SOPs.")
-    if not insights:
-        insights.append("No concentrated themes after cleaning; phrases are distributed.")
-
-    st.markdown("Key Insights from Responses")
-    for p in insights:
-        st.markdown(f"- {p}")
+        st.markdown("Key Insights from Responses")
+        for p in insights:
+            st.markdown(f"- {p}")
 
     # SPARK visuals
     if "SPARK" in filtered.columns:
@@ -860,8 +800,7 @@ with tabs[7]:
         mask = audit_payload["mask"]
         excl_count = audit_payload["count"]
 
-        c1, = st.columns(1)
-        c1.metric("Rows excluded (Demoter AND 'Not Responding')", excl_count)
+        st.metric("Rows excluded (Demoter AND 'Not Responding')", excl_count)
 
         if excl_count > 0:
             affected = pre.loc[mask].copy()
@@ -901,3 +840,5 @@ with tabs[7]:
                 st.info("No suitable columns available to display excluded rows.")
         else:
             st.success("No Demoter rows with 'Not Responding' were found.")
+
+st.caption("© 2025 Johnny & Jugnu | Built by Arbaz Mubasher — Streamlit + Plotly + pandas")
