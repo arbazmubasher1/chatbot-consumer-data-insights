@@ -691,5 +691,3 @@ with tabs[6]:
         st.dataframe(sanity, use_container_width=True)
     else:
         st.info("No timestamp rules evaluated (required columns missing).")
-
-st.caption("© 2025 Johnny & Jugnu | Built by Arbaz Mubasher — Streamlit + Plotly + pandas")
