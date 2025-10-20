@@ -207,8 +207,27 @@ if "Date" in filtered.columns and len(sel_dates) == 2:
     filtered = filtered[(filtered["Date"] >= sel_dates[0]) & (filtered["Date"] <= sel_dates[1])]
 
 # =========================
-# Misclassification Audit + Fix ("Not Responding" tagged Demoters)
+# Exclusion of Demoters with "Not Responding" in Tags
 # =========================
+pre_analysis_df = filtered.copy()  # snapshot before exclusions (for audit only)
+
+excluded_mask = pd.Series(False, index=filtered.index)
+if set(["Tags", "Feedback Head"]).issubset(filtered.columns):
+    nr_mask = filtered["Tags"].str.contains(r"\bNot Responding\b", case=False, na=False)
+    demoter_mask = filtered["Feedback Head"].astype(str).str.casefold().eq("demoter")
+    excluded_mask = nr_mask & demoter_mask
+
+excluded_count = int(excluded_mask.sum())
+filtered = filtered[~excluded_mask].copy()  # remove those rows from all downstream analyses
+
+# Keep an audit payload for the tab
+audit_payload = {
+    "pre": pre_analysis_df,        # before exclusion
+    "post": filtered.copy(),       # after exclusion
+    "mask": excluded_mask,         # which rows were excluded
+    "count": excluded_count,
+}
+
 pre_classification = filtered.copy()  # snapshot before we fix labels
 
 misclassified_mask = pd.Series(False, index=filtered.index)
@@ -732,7 +751,7 @@ with tabs[6]:
 # 8) CLASSIFICATION AUDIT
 # ======================================================
 with tabs[7]:
-    st.title("Classification Audit — 'Not Responding' marked as Demoter")
+    st.title("Exclusions Audit — Demoter with 'Not Responding'")
 
     if "audit_payload" not in locals():
         st.info("No audit payload available.")
@@ -740,70 +759,38 @@ with tabs[7]:
         pre = audit_payload["pre"]
         post = audit_payload["post"]
         mask = audit_payload["mask"]
-        mis_count = audit_payload["count"]
-        demoters_pre = audit_payload["demoters_pre"]
-        share = audit_payload["share"]
-        nps_before = audit_payload["nps_before"]
-        nps_after = audit_payload["nps_after"]
-        nps_delta = audit_payload["nps_delta"]
+        excl_count = audit_payload["count"]
 
-        # Headline metrics
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Tickets Reclassified", mis_count)
-        c2.metric("Share of all Demoters impacted", f"{share:.1f}%")
-        c3.metric("NPS (Before Fix)", f"{nps_before:.1f}")
-        c4.metric("NPS (After Fix)", f"{nps_after:.1f}", delta=f"{nps_delta:+.1f}")
+        c1, = st.columns(1)
+        c1.metric("Rows excluded (Demoter AND 'Not Responding')", excl_count)
 
-        if mis_count > 0:
+        if excl_count > 0:
             affected = pre.loc[mask].copy()
 
-            # By Branch
             if "Branch Name" in affected.columns:
-                st.subheader("Misclassified by Branch (pre-fix)")
+                st.subheader("Excluded by Branch")
                 b = affected["Branch Name"].value_counts().reset_index()
                 b.columns = ["Branch", "Count"]
                 fig_b = px.bar(b, x="Count", y="Branch", orientation="h", text="Count",
-                               title="Misclassified (Demoter + 'Not Responding') by Branch")
+                               title="Excluded (Demoter + 'Not Responding') by Branch")
                 st.plotly_chart(fig_b, use_container_width=True)
 
-            # By Shift
             if "Shift" in affected.columns:
-                st.subheader("Misclassified by Shift (pre-fix)")
+                st.subheader("Excluded by Shift")
                 s = affected["Shift"].value_counts().reset_index()
                 s.columns = ["Shift", "Count"]
                 s["Shift (Time)"] = s["Shift"].map(lambda x: f"{x} ({SHIFT_TIMES.get(x,'')})")
                 fig_s = px.bar(s, x="Count", y="Shift (Time)", orientation="h", text="Count",
-                               title="Misclassified (Demoter + 'Not Responding') by Shift")
+                               title="Excluded (Demoter + 'Not Responding') by Shift")
                 st.plotly_chart(fig_s, use_container_width=True)
 
-            # Over Time (by WeekStart)
             if "WeekStart" in affected.columns:
-                st.subheader("Misclassified over Time (ISO Week)")
+                st.subheader("Exclusions over Time (ISO Week)")
                 w = affected.groupby("WeekStart").size().reset_index(name="Count").sort_values("WeekStart")
-                fig_w = px.line(w, x="WeekStart", y="Count", markers=True, title="Weekly Count of Misclassified Tickets")
+                fig_w = px.line(w, x="WeekStart", y="Count", markers=True, title="Weekly Count of Excluded Rows")
                 st.plotly_chart(fig_w, use_container_width=True)
 
-            # Impact by Branch — NPS before vs after
-            if set(["Branch Name","Feedback Head"]).issubset(post.columns):
-                st.subheader("NPS Impact by Branch (Before vs After)")
-                def _nps(gdf):
-                    total = len(gdf)
-                    if total == 0: return np.nan
-                    return (gdf["Feedback Head"].eq("Promoter").mean()*100.0) - \
-                           (gdf["Feedback Head"].eq("Demoter").mean()*100.0)
-                nps_pre_b = pre.groupby("Branch Name").apply(_nps).reset_index(name="NPS_Before")
-                nps_post_b = post.groupby("Branch Name").apply(_nps).reset_index(name="NPS_After")
-                nps_br = nps_pre_b.merge(nps_post_b, on="Branch Name", how="outer")
-                nps_br["Delta NPS"] = nps_br["NPS_After"] - nps_br["NPS_Before"]
-                nps_br = nps_br.sort_values("Delta NPS", ascending=False).fillna(0)
-
-                fig_delta = px.bar(nps_br, x="Branch Name", y="Delta NPS",
-                                   title="Delta NPS by Branch (After − Before)",
-                                   text=nps_br["Delta NPS"].round(1))
-                st.plotly_chart(fig_delta, use_container_width=True)
-
-            # Table of affected tickets (safe columns)
-            st.subheader("Affected Tickets (pre-fix)")
+            st.subheader("Excluded Rows (details)")
             cols = [c for c in [
                 "Ticket number","Created At","Branch Name","Shift","DayOfWeek",
                 "Tags","Feedback Head","Description"
@@ -812,8 +799,6 @@ with tabs[7]:
                 st.dataframe(affected[cols].sort_values("Created At").reset_index(drop=True),
                              use_container_width=True, height=380)
             else:
-                st.info("No suitable columns available to display affected tickets.")
+                st.info("No suitable columns available to display excluded rows.")
         else:
-            st.success("No Demoter tickets were tagged with 'Not Responding'.")
-
-st.caption("© 2025 Johnny & Jugnu | Built by Arbaz Mubasher — Streamlit + Plotly + pandas")
+            st.success("No Demoter rows with 'Not Responding' were found.")
