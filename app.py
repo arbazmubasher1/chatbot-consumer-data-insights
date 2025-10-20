@@ -551,9 +551,87 @@ with tabs[3]:
             st.plotly_chart(fig_st, use_container_width=True)
 
 # -----------------------------
-# Text Mining on Descriptions
+# Text Mining on Descriptions (no sklearn)
 # -----------------------------
 st.subheader("Text Mining on Descriptions")
+
+def simple_tokenize(s: str) -> list[str]:
+    # alphabetic tokens len>=2, lowercased
+    return re.findall(r"\b[a-z][a-z]+\b", s.lower())
+
+# english stopwords (trimmed) + domain stopwords you can extend any time
+EN_SW = {
+    # english-ish
+    "a","an","and","the","or","for","to","of","in","on","at","by","from","with","without","into","over","under",
+    "is","are","was","were","am","be","been","being","as","it","this","that","these","those",
+    "i","we","you","he","she","they","them","his","her","their","our","my","your",
+    "do","did","does","done","doing","have","has","had","having","get","got","make","made","give","given",
+    "can","could","may","might","should","would","will","shall","not","no","yes",
+    "very","more","most","less","least","much","many","some","any","all","each","every","both","few","several",
+    "than","then","there","here","also","just","now","still","again","even","ever","never"
+}
+
+DOMAIN_SW = {
+    # generic CX boilerplate and low-signal nouns/verbs
+    "customer","customers","per","order","orders","food","items","item","product","products",
+    "restaurant","branch","place","service","services","system","issue","issues","team","call","called","says","said","told",
+    "minutes","minute","hour","hours","today","yesterday","tomorrow","overall","option","available","provided",
+    "number","phone","rider","delivery","behavior","remarks","standard","kindly","please",
+    # menu fillers (keep the specific faults like cold/undercooked, drop generic nouns)
+    "wrap","wraps","burger","burgers","fries","drink","drinks","dip","sauce","saucy","patty","size",
+}
+
+STOP = EN_SW | DOMAIN_SW
+
+# phrases we never want
+PHRASE_BLACKLIST = {
+    "per customer","the customer","customer the","per the","call back","call again"
+}
+
+def gen_ngrams(tokens: list[str], n: int) -> list[str]:
+    return [" ".join(tokens[i:i+n]) for i in range(len(tokens)-n+1)]
+
+def phrase_ok(p: str) -> bool:
+    if p in PHRASE_BLACKLIST:
+        return False
+    terms = p.split()
+    # drop if starts/ends with stopword
+    if terms[0] in STOP or terms[-1] in STOP:
+        return False
+    # drop if all tokens are stopwords
+    if all(t in STOP for t in terms):
+        return False
+    # drop if any token is 1-char (already filtered by regex, but safe)
+    if any(len(t) <= 2 for t in terms):
+        return False
+    return True
+
+def top_ngrams_from_texts(texts: list[str], n: int, topk: int = 20, min_count: int = 2, max_share: float = 0.8) -> pd.DataFrame:
+    # tokenize each text, remove stopwords, build ngrams
+    all_ngrams = []
+    doc_count = len(texts)
+    if doc_count == 0:
+        return pd.DataFrame(columns=["ngram","count"])
+    for t in texts:
+        toks = [t for t in simple_tokenize(t) if t not in STOP]
+        if len(toks) < n:
+            continue
+        ngrams = [g for g in gen_ngrams(toks, n) if phrase_ok(g)]
+        all_ngrams.extend(ngrams)
+
+    if not all_ngrams:
+        return pd.DataFrame(columns=["ngram","count"])
+
+    # counts
+    cnt = Counter(all_ngrams)
+    # drop extremely common boilerplate ngrams that appear in too many docs
+    # approximate document frequency by counting unique n-grams per text
+    # fast heuristic: if an n-gram contains a token that appears in > max_share texts, suppress; else keep.
+    # fallback: just keep min_count filter.
+    df = pd.DataFrame(cnt.items(), columns=["ngram","count"])
+    df = df[df["count"] >= min_count]
+    df = df.sort_values("count", ascending=False).head(topk).reset_index(drop=True)
+    return df
 
 if "Description" in filtered.columns:
     texts = filtered["Description"].dropna().astype(str).tolist()
@@ -563,75 +641,15 @@ else:
 if len(texts) == 0:
     st.info("No response descriptions found for text analysis.")
 else:
-    # Domain stopwords (augment scikit-learn english set)
-    domain_sw = {
-        # generic
-        "customer","customers","order","orders","food","items","item","product","products",
-        "restaurant","branch","place","service","services","staff","system","issue","issues",
-        "per","the","a","an","and","or","for","to","of","in","with","on","by","at","from",
-        "was","were","is","are","be","been","am","being","got","get","make","made","give",
-        "now","one","two","also","overall","please","kindly","option","available","provided",
-        "minutes","minute","second","seconds","hour","hours","today","yesterday","tomorrow",
-        "call","called","says","said","told","ring","denied","cancelled","cancel",
-        # weak cuisine fillers
-        "wraps","wrap","burger","burgers","fries","drink","drinks","dip","sauce","saucy",
-        # adjust as you review outputs:
-        "standard","customer","per","the","this","that"
-    }
+    top_bi  = top_ngrams_from_texts(texts, n=2, topk=20, min_count=2)
+    top_tri = top_ngrams_from_texts(texts, n=3, topk=20, min_count=2)
 
-    # Build vectorizer
-    def build_vectorizer(ngram_range):
-        return CountVectorizer(
-            lowercase=True,
-            strip_accents="unicode",
-            token_pattern=r"(?u)\b[a-z][a-z]+\b",   # alphabetic tokens length >=2
-            ngram_range=ngram_range,
-            stop_words="english",                   # base english list
-            min_df=2,                               # drop very rare phrases
-            max_df=0.8                              # drop extremely common boilerplate
-        )
-
-    def extract_top_ngrams(text_list, ngram_range=(2,2), topk=25):
-        # First pass with english stopwords
-        vec = build_vectorizer(ngram_range)
-        X = vec.fit_transform(text_list)
-        vocab = np.array(vec.get_feature_names_out())
-        freqs = np.asarray(X.sum(axis=0)).ravel()
-
-        # Helper sets for filtering
-        base_sw = set(vec.get_stop_words() or [])
-        all_sw = base_sw.union(domain_sw)
-
-        def phrase_ok(p):
-            terms = p.split()
-            # remove if starts with a stopword or entirely stopwords
-            if terms[0] in all_sw:
-                return False
-            if all(t in all_sw for t in terms):
-                return False
-            # drop ultra short words dominating the phrase
-            if any(len(t) <= 2 for t in terms):
-                return False
-            return True
-
-        keep_idx = [i for i, p in enumerate(vocab) if phrase_ok(p)]
-        if not keep_idx:
-            return pd.DataFrame(columns=["ngram","count"])
-
-        kept_vocab = vocab[keep_idx]
-        kept_freqs = freqs[keep_idx]
-        order = np.argsort(-kept_freqs)[:topk]
-        return pd.DataFrame({"ngram": kept_vocab[order], "count": kept_freqs[order]})
-
-    # Compute bigrams/trigrams
-    top_bi  = extract_top_ngrams(texts, ngram_range=(2,2), topk=20)
-    top_tri = extract_top_ngrams(texts, ngram_range=(3,3), topk=20)
-
-    # Wordcloud using cleaned phrases (join with spaces so cloud sizes reflect counts)
-    wc_text = " ".join(
-        [(" ".join([p] * int(c))) for p, c in zip(top_bi["ngram"], top_bi["count"])]
-        + [(" ".join([p] * int(c))) for p, c in zip(top_tri["ngram"], top_tri["count"])]
-    )
+    # Wordcloud using cleaned phrases, weighted by counts
+    wc_text_parts = []
+    for df_ng in (top_bi, top_tri):
+        for p, c in zip(df_ng["ngram"], df_ng["count"]):
+            wc_text_parts.extend([p] * int(c))
+    wc_text = " ".join(wc_text_parts)
     if wc_text.strip():
         wc = WordCloud(width=1100, height=360, background_color="white").generate(wc_text)
         fig_wc, ax = plt.subplots(figsize=(12, 4))
@@ -653,22 +671,22 @@ else:
             fig_tri = px.bar(top_tri.head(15), x="count", y="ngram", orientation="h", title="Top Trigrams")
             st.plotly_chart(fig_tri, use_container_width=True)
 
-    # Quick insights based on filtered phrases
-    def has_any(df, keywords):
-        s = " ".join(df["ngram"].tolist())
-        return any(k in s for k in keywords)
+    # Quick insights based on cleaner phrases
+    def phrases_have(df_: pd.DataFrame, keywords: list[str]) -> bool:
+        joined = " ".join(df_["ngram"].tolist())
+        return any(k in joined for k in keywords)
 
     insights = []
-    if has_any(top_bi, ["cold","soggy","undercooked","overcooked"]) or has_any(top_tri, ["food was cold","undercooked chicken"]):
+    if phrases_have(top_bi, ["cold","soggy","undercooked","overcooked"]) or phrases_have(top_tri, ["undercooked chicken","food cold"]):
         insights.append("Temperature/cook issues are frequent; audit hot-hold, cook times, and pass checks.")
-    if has_any(top_bi, ["time above","time between","late","delay"]) or has_any(top_tri, ["order was late"]):
-        insights.append("Speed of service shows up; rebalance staffing and rider timing at peaks.")
-    if has_any(top_bi, ["wrong addons","fries missed","dip missed","wrong sauce","wrong product"]):
+    if phrases_have(top_bi, ["time above","time between","late","delay"]) or phrases_have(top_tri, ["order was late"]):
+        insights.append("Speed of service issues present; rebalance staffing and rider timing at peaks.")
+    if phrases_have(top_bi, ["wrong addons","fries missed","dip missed","wrong sauce","wrong product","missing addons"]):
         insights.append("Accuracy defects present; enforce pack-out checklists and dip/fries scan step.")
-    if has_any(top_bi, ["foreign object","dirty","hygiene"]):
+    if phrases_have(top_bi, ["foreign object","dirty","hygiene"]):
         insights.append("Cleanliness flags exist; reinforce station hygiene SOPs.")
     if not insights:
-        insights.append("No dominant themes after cleaning; phrases are distributed.")
+        insights.append("No concentrated themes after cleaning; phrases are distributed.")
 
     st.markdown("Key Insights from Responses")
     for p in insights:
