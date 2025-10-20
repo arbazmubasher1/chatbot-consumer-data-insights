@@ -9,6 +9,7 @@
 # 5) Branch & Agent
 # 6) Risk & Stability
 # 7) Data Quality
+# 8) Classification Audit
 # -------------------------------------------------------
 
 import os
@@ -27,7 +28,7 @@ from collections import Counter
 # =========================
 # Page Config (MUST be first)
 # =========================
-st.set_page_config(page_title="Restaurant Responses Dashboard", page_icon="🍔", layout="wide")
+st.set_page_config(page_title="Restaurant Responses Dashboard", layout="wide")
 
 # =========================
 # Shift labels & SPARK rules
@@ -180,7 +181,7 @@ df = prepare_data(raw_df)
 # =========================
 # Sidebar Filters
 # =========================
-st.sidebar.header("🔍 Filters")
+st.sidebar.header("Filters")
 branch_options = sorted(df["Branch Name"].dropna().unique()) if "Branch Name" in df.columns else []
 feedback_options = sorted(df["Feedback Head"].dropna().unique()) if "Feedback Head" in df.columns else []
 shift_options = [s for s in ["Breakfast", "Lunch", "Dinner", "Late Night"] if "Shift" in df.columns and s in df["Shift"].unique()]
@@ -205,21 +206,23 @@ if sel_shifts and "Shift" in filtered.columns:
 if "Date" in filtered.columns and len(sel_dates) == 2:
     filtered = filtered[(filtered["Date"] >= sel_dates[0]) & (filtered["Date"] <= sel_dates[1])]
 
-# Reclassify Demoter → Neutral when Tags contain "Not Responding"
+# =========================
+# Misclassification Audit + Fix ("Not Responding" tagged Demoters)
+# =========================
+pre_classification = filtered.copy()  # snapshot before we fix labels
+
+misclassified_mask = pd.Series(False, index=filtered.index)
 if set(["Tags", "Feedback Head"]).issubset(filtered.columns):
     nr_mask = filtered["Tags"].str.contains(r"\bNot Responding\b", case=False, na=False)
     demoter_mask = filtered["Feedback Head"].astype(str).str.casefold().eq("demoter")
-    filtered.loc[nr_mask & demoter_mask, "Feedback Head"] = "Neutral"
+    misclassified_mask = nr_mask & demoter_mask
 
-# =========================
-# Helpers
-# =========================
-def safe_count(frame: pd.DataFrame) -> int:
-    return int(frame.shape[0]) if frame is not None else 0
+# Audit metrics (before fix)
+misclassified_count = int(misclassified_mask.sum())
+total_demoters_pre = int((pre_classification["Feedback Head"] == "Demoter").sum()) if "Feedback Head" in pre_classification.columns else 0
+share_of_demoters = (misclassified_count / total_demoters_pre * 100.0) if total_demoters_pre else 0.0
 
-def pct(n: float, d: float) -> float:
-    return (100.0 * n / d) if d else 0.0
-
+# NPS before fix
 def compute_nps(df_part: pd.DataFrame) -> float:
     if "Feedback Head" not in df_part.columns or df_part.empty:
         return 0.0
@@ -230,24 +233,56 @@ def compute_nps(df_part: pd.DataFrame) -> float:
     demoters = (df_part["Feedback Head"] == "Demoter").sum()
     return (promoters/total*100.0) - (demoters/total*100.0)
 
+nps_before_fix = compute_nps(pre_classification)
+
+# Apply the fix: reclassify Demoter → Neutral when Tags contain "Not Responding"
+if misclassified_count > 0:
+    filtered.loc[misclassified_mask, "Feedback Head"] = "Neutral"
+
+# NPS after fix
+nps_after_fix = compute_nps(filtered)
+nps_delta = nps_after_fix - nps_before_fix
+
+audit_payload = {
+    "pre": pre_classification,
+    "post": filtered.copy(),
+    "mask": misclassified_mask,
+    "count": misclassified_count,
+    "demoters_pre": total_demoters_pre,
+    "share": share_of_demoters,
+    "nps_before": nps_before_fix,
+    "nps_after": nps_after_fix,
+    "nps_delta": nps_delta,
+}
+
+# =========================
+# Helpers
+# =========================
+def safe_count(frame: pd.DataFrame) -> int:
+    return int(frame.shape[0]) if frame is not None else 0
+
+def pct(n: float, d: float) -> float:
+    return (100.0 * n / d) if d else 0.0
+
 # =========================
 # Tabs
 # =========================
 tabs = st.tabs([
-    "📊 Overview",
-    "🗓️ Time Intelligence",
-    "⏱️ Lifecycle & SLA",
-    "🍔 Themes & Text",
-    "🏪 Branch & 👤 Agent",
-    "⚠️ Risk & Stability",
-    "🧼 Data Quality"
+    "Overview",
+    "Time Intelligence",
+    "Lifecycle & SLA",
+    "Themes & Text",
+    "Branch & Agent",
+    "Risk & Stability",
+    "Data Quality",
+    "Classification Audit"
 ])
 
 # ======================================================
 # 1) OVERVIEW
 # ======================================================
 with tabs[0]:
-    st.title("📊 Responses & Feedback Overview")
+    st.title("Responses & Feedback Overview")
 
     total_responses = safe_count(filtered)
     unique_customers = filtered["Customer CLI"].nunique() if "Customer CLI" in filtered.columns else 0
@@ -295,9 +330,9 @@ with tabs[0]:
 # 2) TIME INTELLIGENCE
 # ======================================================
 with tabs[1]:
-    st.title("🗓️ Time Intelligence")
+    st.title("Time Intelligence")
 
-    # Weekday vs Weekend volume + Demoter %
+    # Weekday vs Weekend volume + Demoter % + NPS
     if set(["IsWeekend", "Feedback Head", "Ticket number"]).issubset(filtered.columns):
         tmp = filtered.copy()
         tmp["DayType"] = tmp["IsWeekend"].apply(lambda x: "Weekend" if x else "Weekday")
@@ -309,21 +344,20 @@ with tabs[1]:
         daytype["Demoter %"] = daytype["Demoters"] / daytype["Responses"] * 100.0
         daytype["NPS"] = (daytype["Promoters"]/daytype["Responses"]*100.0) - (daytype["Demoters"]/daytype["Responses"]*100.0)
 
-        bar = go.Bar(x=daytype["DayType"], y=daytype["Responses"], name="Responses", marker_color="#219EBC")
+        bar = go.Bar(x=daytype["DayType"], y=daytype["Responses"], name="Responses")
         line = go.Scatter(x=daytype["DayType"], y=daytype["Demoter %"], name="Demoter %", yaxis="y2", mode="lines+markers")
         fig_combo = go.Figure(data=[bar, line])
         fig_combo.update_layout(
-            title="📆 Weekday vs Weekend Responses (w/ Demoter %)",
+            title="Weekday vs Weekend Responses (with Demoter %)",
             yaxis=dict(title="Responses"),
             yaxis2=dict(title="Demoter %", overlaying="y", side="right"),
             legend=dict(orientation="h")
         )
         st.plotly_chart(fig_combo, use_container_width=True)
 
-        # Weekday vs Weekend NPS
         fig_nps_dw = px.bar(
             daytype, x="DayType", y="NPS",
-            title="📅 Weekday vs Weekend NPS",
+            title="Weekday vs Weekend NPS",
             text=daytype["NPS"].round(1)
         )
         fig_nps_dw.update_layout(xaxis_title="", yaxis_title="NPS")
@@ -333,7 +367,7 @@ with tabs[1]:
     if "DayOfWeek" in filtered.columns:
         order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
         dow = filtered.groupby("DayOfWeek").size().reindex(order).reset_index(name="Responses")
-        fig_dow = px.line(dow, x="DayOfWeek", y="Responses", markers=True, title="📈 Responses by Day of Week")
+        fig_dow = px.line(dow, x="DayOfWeek", y="Responses", markers=True, title="Responses by Day of Week")
         st.plotly_chart(fig_dow, use_container_width=True)
 
     # Intraday heatmap (Hour x DayOfWeek)
@@ -342,7 +376,7 @@ with tabs[1]:
         intraday_pivot = intraday.pivot_table(index="Hour", columns="DayOfWeek",
                                               values="Ticket number", aggfunc="count", fill_value=0)
         intraday_pivot = intraday_pivot.reindex(columns=["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"], fill_value=0)
-        fig_heat = px.imshow(intraday_pivot, color_continuous_scale="YlOrRd", title="🔥 Intraday Responses Heatmap (Hour × Day)")
+        fig_heat = px.imshow(intraday_pivot, color_continuous_scale="YlOrRd", title="Intraday Responses Heatmap (Hour × Day)")
         st.plotly_chart(fig_heat, use_container_width=True)
 
     # Weekly Response Trend (ISO)
@@ -358,7 +392,7 @@ with tabs[1]:
             wk, x="WeekStart", y="Responses", markers=True,
             hover_data={"WeekStart": False, "WeekLabel": True, "ISO_Year": False, "ISO_Week": False}
         )
-        fig_weekly.update_layout(title="🗓 Weekly Response Trend (ISO weeks, Monday start)",
+        fig_weekly.update_layout(title="Weekly Response Trend (ISO weeks, Monday start)",
                                  xaxis_title="Week (Mon start)", yaxis_title="Responses")
         st.plotly_chart(fig_weekly, use_container_width=True)
 
@@ -378,7 +412,7 @@ with tabs[1]:
         fig_nps_shift = px.bar(
             nps_shift.sort_values("NPS", ascending=False),
             x="Shift (Time)", y="NPS",
-            title="⭐ Shift-wise NPS (Promoters% − Demoters%)",
+            title="Shift-wise NPS (Promoters% − Demoters%)",
             text=nps_shift["NPS"].round(1)
         )
         fig_nps_shift.update_layout(xaxis_title="Shift (with time slot)", yaxis_title="NPS")
@@ -387,7 +421,7 @@ with tabs[1]:
         fig_vol_shift = px.bar(
             nps_shift.sort_values("Responses", ascending=False),
             x="Shift (Time)", y="Responses",
-            title="📦 Shift-wise Responses (volume)",
+            title="Shift-wise Responses (volume)",
             text="Responses"
         )
         fig_vol_shift.update_layout(xaxis_title="Shift (with time slot)", yaxis_title="Responses")
@@ -405,19 +439,19 @@ with tabs[1]:
             )
             dow_nps["NPS"] = (dow_nps["Promoters"]/dow_nps["Responses"]*100.0) - (dow_nps["Demoters"]/dow_nps["Responses"]*100.0)
             best_days = dow_nps.query("Responses >= @MIN_RESP").sort_values("NPS", ascending=False)
-            st.subheader("🏆 Best Performing Days (by NPS)")
+            st.subheader("Best Performing Days (by NPS)")
             st.dataframe(best_days, use_container_width=True)
 
         best_shifts = nps_shift.query("Responses >= @MIN_RESP").sort_values("NPS", ascending=False).copy()
         best_shifts["Shift (Time)"] = best_shifts["Shift"].map(lambda s: f"{s} ({SHIFT_TIMES.get(s,'')})")
-        st.subheader("🏆 Best Performing Shifts (by NPS)")
+        st.subheader("Best Performing Shifts (by NPS)")
         st.dataframe(best_shifts[["Shift (Time)","Responses","NPS","Promoters","Demoters"]], use_container_width=True)
 
 # ======================================================
 # 3) LIFECYCLE & SLA
 # ======================================================
 with tabs[2]:
-    st.title("⏱️ Lifecycle & SLA")
+    st.title("Lifecycle & SLA")
 
     created_cnt = safe_count(filtered)
     first_reply_cnt = int(filtered["First Public Reply At"].notna().sum()) if "First Public Reply At" in filtered.columns else 0
@@ -428,16 +462,16 @@ with tabs[2]:
         "Stage": ["Created", "First Public Reply", "Closed", "Re-Opened"],
         "Count": [created_cnt, first_reply_cnt, closed_cnt, reopened_cnt]
     })
-    fig_fun = px.funnel(funnel_df, x="Count", y="Stage", title="🎯 Ticket Funnel")
+    fig_fun = px.funnel(funnel_df, x="Count", y="Stage", title="Ticket Funnel")
     st.plotly_chart(fig_fun, use_container_width=True)
 
     if "FRT_min" in filtered.columns and filtered["FRT_min"].notna().sum() > 0:
-        fig_frt = px.histogram(filtered, x="FRT_min", nbins=50, title="⏱ First Response Time (minutes) – Distribution")
+        fig_frt = px.histogram(filtered, x="FRT_min", nbins=50, title="First Response Time (minutes) – Distribution")
         fig_frt.add_vline(x=np.nanmedian(filtered["FRT_min"]), line_dash="dash", annotation_text="Median", annotation_position="top")
         st.plotly_chart(fig_frt, use_container_width=True)
 
     if "TTR_min" in filtered.columns and filtered["TTR_min"].notna().sum() > 0:
-        fig_ttr = px.histogram(filtered, x="TTR_min", nbins=50, title="🛠️ Resolution Time (minutes) – Distribution")
+        fig_ttr = px.histogram(filtered, x="TTR_min", nbins=50, title="Resolution Time (minutes) – Distribution")
         fig_ttr.add_vline(x=np.nanmedian(filtered["TTR_min"]), line_dash="dash", annotation_text="Median", annotation_position="top")
         st.plotly_chart(fig_ttr, use_container_width=True)
 
@@ -446,27 +480,27 @@ with tabs[2]:
             sla_branch = filtered.pivot_table(index="Branch Name", values="SLA Breach",
                                               aggfunc=lambda s: np.mean(s.fillna(False).astype(float))*100)
             fig_sla_b = px.imshow(sla_branch.sort_values("SLA Breach"), color_continuous_scale="Reds",
-                                  title="🚨 SLA Breach % by Branch", text_auto=".1f")
+                                  title="SLA Breach % by Branch", text_auto=".1f")
             st.plotly_chart(fig_sla_b, use_container_width=True)
 
         if "Shift" in filtered.columns:
             sla_shift = filtered.pivot_table(index="Shift", values="SLA Breach",
                                              aggfunc=lambda s: np.mean(s.fillna(False).astype(float))*100)
             sla_shift = sla_shift.reindex(["Breakfast","Lunch","Dinner","Late Night"]).fillna(0)
-            fig_sla_s = px.imshow(sla_shift, color_continuous_scale="Reds", title="🚨 SLA Breach % by Shift", text_auto=".1f")
+            fig_sla_s = px.imshow(sla_shift, color_continuous_scale="Reds", title="SLA Breach % by Shift", text_auto=".1f")
             st.plotly_chart(fig_sla_s, use_container_width=True)
 
     if set(["Re-Opened","Branch Name"]).issubset(filtered.columns):
         reopen_by_branch = filtered.groupby("Branch Name")["Re-Opened"].apply(lambda s: np.mean(s.fillna(False))*100).reset_index(name="Reopen %")
         fig_ro = px.bar(reopen_by_branch.sort_values("Reopen %", ascending=False), x="Branch Name", y="Reopen %",
-                        title="♻️ Reopen % by Branch")
+                        title="Reopen % by Branch")
         st.plotly_chart(fig_ro, use_container_width=True)
 
 # ======================================================
 # 4) THEMES & TEXT
 # ======================================================
 with tabs[3]:
-    st.title("🍔 Themes & Text Analysis")
+    st.title("Themes & Text Analysis")
 
     # Tag × Branch heatmap
     if set(["Tags","Branch Name","Ticket number"]).issubset(filtered.columns):
@@ -489,7 +523,7 @@ with tabs[3]:
             fig_ts = px.imshow(ts, color_continuous_scale="YlOrRd", title=f"Tag × Shift Heatmap (Top {topN} Tags)")
             st.plotly_chart(fig_ts, use_container_width=True)
 
-    # Sentiment by Tag (100% stacked)
+    # Sentiment by Tag
     if set(["Tags","Feedback Head"]).issubset(filtered.columns):
         sent_tag = filtered[filtered["Tags"].isin(top_tag_values)].groupby(["Tags","Feedback Head"]).size().reset_index(name="Count")
         if not sent_tag.empty:
@@ -498,7 +532,7 @@ with tabs[3]:
             st.plotly_chart(fig_st, use_container_width=True)
 
     # Text mining
-    st.subheader("📝 Text Mining on Descriptions")
+    st.subheader("Text Mining on Descriptions")
     text = " ".join(filtered["Description"].dropna().astype(str)) if "Description" in filtered.columns else ""
     if text.strip():
         wc = WordCloud(width=900, height=400, background_color="white").generate(text)
@@ -519,29 +553,29 @@ with tabs[3]:
         c1, c2 = st.columns(2)
         with c1:
             if not bi_df.empty:
-                st.markdown("**Top Bigrams**")
+                st.markdown("Top Bigrams")
                 st.dataframe(bi_df, use_container_width=True)
         with c2:
             if not tri_df.empty:
-                st.markdown("**Top Trigrams**")
+                st.markdown("Top Trigrams")
                 st.dataframe(tri_df, use_container_width=True)
 
         common_terms = [w for w, _ in Counter(tokens).most_common(30)]
         insights = []
-        if any(w in common_terms for w in ["cold","soggy","undercooked"]): insights.append("Frequent *temperature/undercooked* issues — review hot-hold & pass-through checks.")
-        if any(w in common_terms for w in ["delay","late","slow","time"]): insights.append("Strong *delay* signal — rebalance rider allocation & prep station throughput.")
-        if any(w in common_terms for w in ["wrong","missing","item","order","addons","sauce"]): insights.append("Order *accuracy/packing* concerns — add pack checklist & QC at peak.")
-        if any(w in common_terms for w in ["service","respond","answer","call"]): insights.append("Customer *service/response* gaps — tighten first-reply SOPs & scripts.")
-        if any(w in common_terms for w in ["fries","burger","drink"]): insights.append("Product-specific feedback (fries/burger/drinks) — focus recipe adherence & batch timing.")
+        if any(w in common_terms for w in ["cold","soggy","undercooked"]): insights.append("Frequent temperature/undercooked issues — review hot-hold and pass-through checks.")
+        if any(w in common_terms for w in ["delay","late","slow","time"]): insights.append("Strong delay signal — rebalance rider allocation and prep station throughput.")
+        if any(w in common_terms for w in ["wrong","missing","item","order","addons","sauce"]): insights.append("Order accuracy/packing concerns — add pack checklist and QC at peak.")
+        if any(w in common_terms for w in ["service","respond","answer","call"]): insights.append("Customer service/response gaps — tighten first-reply SOPs and scripts.")
+        if any(w in common_terms for w in ["fries","burger","drink"]): insights.append("Product-specific feedback (fries/burger/drinks) — focus recipe adherence and batch timing.")
         if not insights:
             insights.append("No dominant repeating theme detected — responses are dispersed.")
-        st.markdown("### 🧠 Key Insights from Responses")
+        st.markdown("Key Insights from Responses")
         for p in insights:
             st.markdown(f"- {p}")
 
     # SPARK visuals
     if "SPARK" in filtered.columns:
-        st.subheader("⚡ SPARK Breakdown (Top Drivers)")
+        st.subheader("SPARK Breakdown (Top Drivers)")
         spark_counts = filtered["SPARK"].value_counts().reset_index()
         spark_counts.columns = ["SPARK", "Responses"]
         fig_spark = px.bar(spark_counts, x="Responses", y="SPARK", orientation="h", text="Responses",
@@ -561,7 +595,7 @@ with tabs[3]:
 # 5) BRANCH & AGENT
 # ======================================================
 with tabs[4]:
-    st.title("🏪 Branch & 👤 Agent Analytics")
+    st.title("Branch & Agent Analytics")
 
     frames = []
     if "Branch Name" in filtered.columns and "Feedback Head" in filtered.columns:
@@ -597,7 +631,7 @@ with tabs[4]:
         ).reset_index()
         agent_agg = agent_agg[agent_agg["Responses"] > 0]
         fig_agent = px.scatter(agent_agg, x="Responses", y="Median_TTR", color="DemoterRate",
-                               hover_data=["Team Member"], title="👤 Agent Throughput vs Resolution Time (color=Demoter %)")
+                               hover_data=["Team Member"], title="Agent Throughput vs Resolution Time (color=Demoter %)")
         st.plotly_chart(fig_agent, use_container_width=True)
 
     if set(["Team Member","SLA Breach","Ticket number"]).issubset(filtered.columns):
@@ -606,14 +640,14 @@ with tabs[4]:
             SLABreachRate=("SLA Breach", lambda s: np.mean(s.fillna(False))*100)
         ).reset_index()
         fig_wl = px.scatter(workload, x="Responses", y="SLABreachRate", size="Responses", hover_data=["Team Member"],
-                            title="📦 Workload vs SLA Breach Rate (by Agent)")
+                            title="Workload vs SLA Breach Rate (by Agent)")
         st.plotly_chart(fig_wl, use_container_width=True)
 
 # ======================================================
 # 6) RISK & STABILITY
 # ======================================================
 with tabs[5]:
-    st.title("⚠️ Risk & Stability (SPC & Outliers)")
+    st.title("Risk & Stability (SPC & Outliers)")
 
     if set(["Date","Ticket number"]).issubset(filtered.columns):
         daily = filtered.groupby("Date").agg(
@@ -631,7 +665,7 @@ with tabs[5]:
             fig_cc.add_hline(y=mu, line_dash="dash", annotation_text="Mean")
             fig_cc.add_hline(y=ucl, line_dash="dot", line_color="red", annotation_text="UCL (+3σ)")
             fig_cc.add_hline(y=lcl, line_dash="dot", line_color="red", annotation_text="LCL (-3σ)")
-            fig_cc.update_layout(title="📉 Control Chart – Daily Demoter %")
+            fig_cc.update_layout(title="Control Chart – Daily Demoter %")
             st.plotly_chart(fig_cc, use_container_width=True)
 
     out = filtered.copy()
@@ -643,7 +677,7 @@ with tabs[5]:
         cut_frt = np.nanpercentile(out["FRT_min"], 99)
         out.loc[out["FRT_min"] >= cut_frt, "Outlier"] = True
 
-    st.subheader("🔎 Outlier Tickets (top 1% FRT/TTR)")
+    st.subheader("Outlier Tickets (top 1% FRT/TTR)")
     cols = [c for c in ["Ticket number","Branch Name","Tags","Shift","Feedback Head","FRT_min","TTR_min","Created At","Closed At"] if c in out.columns]
     if cols:
         st.dataframe(out[out["Outlier"]][cols].sort_values(["TTR_min","FRT_min"], ascending=False).head(50), use_container_width=True)
@@ -654,7 +688,7 @@ with tabs[5]:
 # 7) DATA QUALITY
 # ======================================================
 with tabs[6]:
-    st.title("🧼 Data Quality & Governance")
+    st.title("Data Quality & Governance")
 
     key_cols = [
         "Branch Name","Feedback Head","Tags","Description","First Public Reply At",
@@ -666,7 +700,7 @@ with tabs[6]:
             "Field": present_cols,
             "Missing %": [filtered[c].isna().mean()*100 for c in present_cols]
         }).sort_values("Missing %", ascending=False)
-        fig_miss = px.bar(miss_df, x="Missing %", y="Field", orientation="h", title="🚧 Missingness by Field")
+        fig_miss = px.bar(miss_df, x="Missing %", y="Field", orientation="h", title="Missingness by Field")
         st.plotly_chart(fig_miss, use_container_width=True)
     else:
         st.info("No key fields found for missingness check.")
@@ -689,7 +723,97 @@ with tabs[6]:
 
     sanity = pd.DataFrame(sanity_rows)
     if not sanity.empty:
-        st.subheader("🧪 Timestamp Sanity Checks")
+        st.subheader("Timestamp Sanity Checks")
         st.dataframe(sanity, use_container_width=True)
     else:
         st.info("No timestamp rules evaluated (required columns missing).")
+
+# ======================================================
+# 8) CLASSIFICATION AUDIT
+# ======================================================
+with tabs[7]:
+    st.title("Classification Audit — 'Not Responding' marked as Demoter")
+
+    if "audit_payload" not in locals():
+        st.info("No audit payload available.")
+    else:
+        pre = audit_payload["pre"]
+        post = audit_payload["post"]
+        mask = audit_payload["mask"]
+        mis_count = audit_payload["count"]
+        demoters_pre = audit_payload["demoters_pre"]
+        share = audit_payload["share"]
+        nps_before = audit_payload["nps_before"]
+        nps_after = audit_payload["nps_after"]
+        nps_delta = audit_payload["nps_delta"]
+
+        # Headline metrics
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Tickets Reclassified", mis_count)
+        c2.metric("Share of all Demoters impacted", f"{share:.1f}%")
+        c3.metric("NPS (Before Fix)", f"{nps_before:.1f}")
+        c4.metric("NPS (After Fix)", f"{nps_after:.1f}", delta=f"{nps_delta:+.1f}")
+
+        if mis_count > 0:
+            affected = pre.loc[mask].copy()
+
+            # By Branch
+            if "Branch Name" in affected.columns:
+                st.subheader("Misclassified by Branch (pre-fix)")
+                b = affected["Branch Name"].value_counts().reset_index()
+                b.columns = ["Branch", "Count"]
+                fig_b = px.bar(b, x="Count", y="Branch", orientation="h", text="Count",
+                               title="Misclassified (Demoter + 'Not Responding') by Branch")
+                st.plotly_chart(fig_b, use_container_width=True)
+
+            # By Shift
+            if "Shift" in affected.columns:
+                st.subheader("Misclassified by Shift (pre-fix)")
+                s = affected["Shift"].value_counts().reset_index()
+                s.columns = ["Shift", "Count"]
+                s["Shift (Time)"] = s["Shift"].map(lambda x: f"{x} ({SHIFT_TIMES.get(x,'')})")
+                fig_s = px.bar(s, x="Count", y="Shift (Time)", orientation="h", text="Count",
+                               title="Misclassified (Demoter + 'Not Responding') by Shift")
+                st.plotly_chart(fig_s, use_container_width=True)
+
+            # Over Time (by WeekStart)
+            if "WeekStart" in affected.columns:
+                st.subheader("Misclassified over Time (ISO Week)")
+                w = affected.groupby("WeekStart").size().reset_index(name="Count").sort_values("WeekStart")
+                fig_w = px.line(w, x="WeekStart", y="Count", markers=True, title="Weekly Count of Misclassified Tickets")
+                st.plotly_chart(fig_w, use_container_width=True)
+
+            # Impact by Branch — NPS before vs after
+            if set(["Branch Name","Feedback Head"]).issubset(post.columns):
+                st.subheader("NPS Impact by Branch (Before vs After)")
+                def _nps(gdf):
+                    total = len(gdf)
+                    if total == 0: return np.nan
+                    return (gdf["Feedback Head"].eq("Promoter").mean()*100.0) - \
+                           (gdf["Feedback Head"].eq("Demoter").mean()*100.0)
+                nps_pre_b = pre.groupby("Branch Name").apply(_nps).reset_index(name="NPS_Before")
+                nps_post_b = post.groupby("Branch Name").apply(_nps).reset_index(name="NPS_After")
+                nps_br = nps_pre_b.merge(nps_post_b, on="Branch Name", how="outer")
+                nps_br["Delta NPS"] = nps_br["NPS_After"] - nps_br["NPS_Before"]
+                nps_br = nps_br.sort_values("Delta NPS", ascending=False).fillna(0)
+
+                fig_delta = px.bar(nps_br, x="Branch Name", y="Delta NPS",
+                                   title="Delta NPS by Branch (After − Before)",
+                                   text=nps_br["Delta NPS"].round(1))
+                st.plotly_chart(fig_delta, use_container_width=True)
+
+            # Table of affected tickets (safe columns)
+            st.subheader("Affected Tickets (pre-fix)")
+            cols = [c for c in [
+                "Ticket number","Created At","Branch Name","Shift","DayOfWeek",
+                "Tags","Feedback Head","Description"
+            ] if c in pre.columns]
+            if cols:
+                st.dataframe(affected[cols].sort_values("Created At").reset_index(drop=True),
+                             use_container_width=True, height=380)
+            else:
+                st.info("No suitable columns available to display affected tickets.")
+        else:
+            st.success("No Demoter tickets were tagged with 'Not Responding'.")
+
+st.caption("© 2025 Johnny & Jugnu | Built by Arbaz Mubasher — Streamlit + Plotly + pandas")
