@@ -11,7 +11,7 @@
 # 7) Data Quality
 # 8) Classification Audit
 # -------------------------------------------------------
-
+from sklearn.feature_extraction.text import CountVectorizer
 import os
 import io
 import re
@@ -550,47 +550,129 @@ with tabs[3]:
                             title="Sentiment Breakdown by Tag", text="Count")
             st.plotly_chart(fig_st, use_container_width=True)
 
-    # Text mining
-    st.subheader("Text Mining on Descriptions")
-    text = " ".join(filtered["Description"].dropna().astype(str)) if "Description" in filtered.columns else ""
-    if text.strip():
-        wc = WordCloud(width=900, height=400, background_color="white").generate(text)
-        fig_wc, ax = plt.subplots(figsize=(10, 4))
+# -----------------------------
+# Text Mining on Descriptions
+# -----------------------------
+st.subheader("Text Mining on Descriptions")
+
+if "Description" in filtered.columns:
+    texts = filtered["Description"].dropna().astype(str).tolist()
+else:
+    texts = []
+
+if len(texts) == 0:
+    st.info("No response descriptions found for text analysis.")
+else:
+    # Domain stopwords (augment scikit-learn english set)
+    domain_sw = {
+        # generic
+        "customer","customers","order","orders","food","items","item","product","products",
+        "restaurant","branch","place","service","services","staff","system","issue","issues",
+        "per","the","a","an","and","or","for","to","of","in","with","on","by","at","from",
+        "was","were","is","are","be","been","am","being","got","get","make","made","give",
+        "now","one","two","also","overall","please","kindly","option","available","provided",
+        "minutes","minute","second","seconds","hour","hours","today","yesterday","tomorrow",
+        "call","called","says","said","told","ring","denied","cancelled","cancel",
+        # weak cuisine fillers
+        "wraps","wrap","burger","burgers","fries","drink","drinks","dip","sauce","saucy",
+        # adjust as you review outputs:
+        "standard","customer","per","the","this","that"
+    }
+
+    # Build vectorizer
+    def build_vectorizer(ngram_range):
+        return CountVectorizer(
+            lowercase=True,
+            strip_accents="unicode",
+            token_pattern=r"(?u)\b[a-z][a-z]+\b",   # alphabetic tokens length >=2
+            ngram_range=ngram_range,
+            stop_words="english",                   # base english list
+            min_df=2,                               # drop very rare phrases
+            max_df=0.8                              # drop extremely common boilerplate
+        )
+
+    def extract_top_ngrams(text_list, ngram_range=(2,2), topk=25):
+        # First pass with english stopwords
+        vec = build_vectorizer(ngram_range)
+        X = vec.fit_transform(text_list)
+        vocab = np.array(vec.get_feature_names_out())
+        freqs = np.asarray(X.sum(axis=0)).ravel()
+
+        # Helper sets for filtering
+        base_sw = set(vec.get_stop_words() or [])
+        all_sw = base_sw.union(domain_sw)
+
+        def phrase_ok(p):
+            terms = p.split()
+            # remove if starts with a stopword or entirely stopwords
+            if terms[0] in all_sw:
+                return False
+            if all(t in all_sw for t in terms):
+                return False
+            # drop ultra short words dominating the phrase
+            if any(len(t) <= 2 for t in terms):
+                return False
+            return True
+
+        keep_idx = [i for i, p in enumerate(vocab) if phrase_ok(p)]
+        if not keep_idx:
+            return pd.DataFrame(columns=["ngram","count"])
+
+        kept_vocab = vocab[keep_idx]
+        kept_freqs = freqs[keep_idx]
+        order = np.argsort(-kept_freqs)[:topk]
+        return pd.DataFrame({"ngram": kept_vocab[order], "count": kept_freqs[order]})
+
+    # Compute bigrams/trigrams
+    top_bi  = extract_top_ngrams(texts, ngram_range=(2,2), topk=20)
+    top_tri = extract_top_ngrams(texts, ngram_range=(3,3), topk=20)
+
+    # Wordcloud using cleaned phrases (join with spaces so cloud sizes reflect counts)
+    wc_text = " ".join(
+        [(" ".join([p] * int(c))) for p, c in zip(top_bi["ngram"], top_bi["count"])]
+        + [(" ".join([p] * int(c))) for p, c in zip(top_tri["ngram"], top_tri["count"])]
+    )
+    if wc_text.strip():
+        wc = WordCloud(width=1100, height=360, background_color="white").generate(wc_text)
+        fig_wc, ax = plt.subplots(figsize=(12, 4))
         ax.imshow(wc, interpolation="bilinear")
         ax.axis("off")
         st.pyplot(fig_wc)
 
-        def clean_tokens(s):
-            return re.findall(r"\b[a-zA-Z]{3,}\b", s.lower())
-        tokens = clean_tokens(text)
-        bigrams = [" ".join(p) for p in zip(tokens, tokens[1:])]
-        trigrams = [" ".join((tokens[i], tokens[i+1], tokens[i+2])) for i in range(len(tokens)-2)]
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("Top Bigrams")
+        st.dataframe(top_bi, use_container_width=True)
+        if not top_bi.empty:
+            fig_bi = px.bar(top_bi.head(15), x="count", y="ngram", orientation="h", title="Top Bigrams")
+            st.plotly_chart(fig_bi, use_container_width=True)
+    with c2:
+        st.markdown("Top Trigrams")
+        st.dataframe(top_tri, use_container_width=True)
+        if not top_tri.empty:
+            fig_tri = px.bar(top_tri.head(15), x="count", y="ngram", orientation="h", title="Top Trigrams")
+            st.plotly_chart(fig_tri, use_container_width=True)
 
-        bi_df = pd.DataFrame(Counter(bigrams).most_common(15), columns=["bigram","count"])
-        tri_df = pd.DataFrame(Counter(trigrams).most_common(15), columns=["trigram","count"])
+    # Quick insights based on filtered phrases
+    def has_any(df, keywords):
+        s = " ".join(df["ngram"].tolist())
+        return any(k in s for k in keywords)
 
-        c1, c2 = st.columns(2)
-        with c1:
-            if not bi_df.empty:
-                st.markdown("Top Bigrams")
-                st.dataframe(bi_df, use_container_width=True)
-        with c2:
-            if not tri_df.empty:
-                st.markdown("Top Trigrams")
-                st.dataframe(tri_df, use_container_width=True)
+    insights = []
+    if has_any(top_bi, ["cold","soggy","undercooked","overcooked"]) or has_any(top_tri, ["food was cold","undercooked chicken"]):
+        insights.append("Temperature/cook issues are frequent; audit hot-hold, cook times, and pass checks.")
+    if has_any(top_bi, ["time above","time between","late","delay"]) or has_any(top_tri, ["order was late"]):
+        insights.append("Speed of service shows up; rebalance staffing and rider timing at peaks.")
+    if has_any(top_bi, ["wrong addons","fries missed","dip missed","wrong sauce","wrong product"]):
+        insights.append("Accuracy defects present; enforce pack-out checklists and dip/fries scan step.")
+    if has_any(top_bi, ["foreign object","dirty","hygiene"]):
+        insights.append("Cleanliness flags exist; reinforce station hygiene SOPs.")
+    if not insights:
+        insights.append("No dominant themes after cleaning; phrases are distributed.")
 
-        common_terms = [w for w, _ in Counter(tokens).most_common(30)]
-        insights = []
-        if any(w in common_terms for w in ["cold","soggy","undercooked"]): insights.append("Frequent temperature/undercooked issues — review hot-hold and pass-through checks.")
-        if any(w in common_terms for w in ["delay","late","slow","time"]): insights.append("Strong delay signal — rebalance rider allocation and prep station throughput.")
-        if any(w in common_terms for w in ["wrong","missing","item","order","addons","sauce"]): insights.append("Order accuracy/packing concerns — add pack checklist and QC at peak.")
-        if any(w in common_terms for w in ["service","respond","answer","call"]): insights.append("Customer service/response gaps — tighten first-reply SOPs and scripts.")
-        if any(w in common_terms for w in ["fries","burger","drink"]): insights.append("Product-specific feedback (fries/burger/drinks) — focus recipe adherence and batch timing.")
-        if not insights:
-            insights.append("No dominant repeating theme detected — responses are dispersed.")
-        st.markdown("Key Insights from Responses")
-        for p in insights:
-            st.markdown(f"- {p}")
+    st.markdown("Key Insights from Responses")
+    for p in insights:
+        st.markdown(f"- {p}")
 
     # SPARK visuals
     if "SPARK" in filtered.columns:
