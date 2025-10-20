@@ -22,11 +22,51 @@ import plotly.express as px
 import plotly.graph_objects as go
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
+from collections import Counter
 
 # =========================
 # Page Config (MUST be first)
 # =========================
 st.set_page_config(page_title="Restaurant Responses Dashboard", page_icon="🍔", layout="wide")
+
+# =========================
+# Shift labels & SPARK rules
+# =========================
+SHIFT_TIMES = {
+    "Breakfast": "7 AM – 12 PM",
+    "Lunch": "12 PM – 5 PM",
+    "Dinner": "5 PM – 11 PM",
+    "Late Night": "11 PM – 7 AM",
+}
+
+def classify_spark(tag: str) -> str:
+    if not isinstance(tag, str):
+        return "Unclassified"
+    t = tag.lower()
+
+    # Speed of Service
+    if any(k in t for k in ["time above", "time between", "delay", "late", "slow", "time", "responding"]):
+        return "SPARK: Speed of Service"
+
+    # Product Quality
+    if any(k in t for k in ["cold", "soggy", "undercooked", "overcooked", "raw", "oily", "unfresh",
+                            "dryness", "dry", "stale", "patty size", "burnt", "chicken item", "bakery item"]):
+        return "SPARK: Product Quality"
+
+    # Accuracy
+    if any(k in t for k in ["wrong", "missed", "missing", "addons", "dip missed", "fries missed",
+                            "wrong product", "wrong sauce", "product missed"]):
+        return "SPARK: Accuracy"
+
+    # Relationship (CX / delivery / others)
+    if any(k in t for k in ["service", "remarks", "compensated", "delivery", "others", "not responding"]):
+        return "SPARK: Relationship"
+
+    # Keep it Clean
+    if any(k in t for k in ["foreign object", "hygiene", "clean", "dirty"]):
+        return "SPARK: Keep it Clean"
+
+    return "Unclassified"
 
 # =========================
 # Data Source (Local ➜ Secrets URL ➜ Uploader)
@@ -61,12 +101,9 @@ def parse_excel_bytes(xls_bytes: bytes, preferred_sheet: str = "tickets") -> pd.
     return _read_excel_from_bytes(xls_bytes, preferred_sheet)
 
 def load_data(preferred_sheet: str = "tickets") -> pd.DataFrame:
-    # 1) Local
     xls_bytes = _try_load_local(DATA_PATH)
-    # 2) Secrets URL (recommended on Streamlit Cloud)
     if xls_bytes is None:
         xls_bytes = _try_load_from_secret_url()
-    # 3) Manual upload
     if xls_bytes is None:
         st.warning("No local file found and no secret URL configured. Upload an Excel file to continue.")
         up = st.file_uploader("Upload responses Excel (.xlsx)", type=["xlsx"])
@@ -82,7 +119,7 @@ def load_data(preferred_sheet: str = "tickets") -> pd.DataFrame:
 def prepare_data(raw: pd.DataFrame) -> pd.DataFrame:
     df = raw.copy()
 
-    # Parse timestamps safely
+    # Parse timestamps
     time_cols = [
         "Created At", "Updated At", "First Public Reply At", "First Private Reply At",
         "Last Public Reply At", "Last Private Reply At", "Opened At", "Closed At",
@@ -92,18 +129,16 @@ def prepare_data(raw: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    # Derived time columns
     created = pd.to_datetime(df.get("Created At"), errors="coerce")
     df["Date"] = created.dt.date
     df["Hour"] = created.dt.hour
     df["DayOfWeek"] = created.dt.day_name()
     df["IsWeekend"] = df["DayOfWeek"].isin(["Saturday", "Sunday"])
 
-    # ✅ ISO weeks + true datetime "WeekStart" (Monday)
-    iso = created.dt.isocalendar()  # DataFrame-like (year, week, day)
+    # ISO week fields + real datetime WeekStart (Monday)
+    iso = created.dt.isocalendar()
     df["ISO_Year"] = iso.year
     df["ISO_Week"] = iso.week
-    # WeekStart = CreatedAt - weekday offset (Mon=0)
     df["WeekStart"] = (created - pd.to_timedelta(created.dt.weekday, unit="D")).dt.normalize()
 
     # Shifts
@@ -116,24 +151,26 @@ def prepare_data(raw: pd.DataFrame) -> pd.DataFrame:
         else: return "Late Night"
     df["Shift"] = df["Hour"].apply(shift_label)
 
-    # Lifecycle durations (minutes)
+    # Durations
     df["FRT_min"] = np.nan
-    if "First Public Reply At" in df.columns and "Created At" in df.columns:
+    if {"First Public Reply At","Created At"}.issubset(df.columns):
         df["FRT_min"] = (df["First Public Reply At"] - df["Created At"]).dt.total_seconds() / 60
-
     df["TTR_min"] = np.nan
-    if "Closed At" in df.columns and "Created At" in df.columns:
+    if {"Closed At","Created At"}.issubset(df.columns):
         df["TTR_min"] = (df["Closed At"] - df["Created At"]).dt.total_seconds() / 60
 
-    # Clean key categoricals
+    # Clean categoricals
     for c in ["Branch Name", "Feedback Head", "Tags", "Team Member", "Pipeline Stage", "Status"]:
         if c in df.columns:
             df[c] = df[c].fillna("Unspecified")
 
-    # Normalize booleans (SLA & flags)
+    # Normalize booleans
     for b in ["First Response SLA", "Resolution SLA", "SLA Breach", "Re-Opened", "Opened"]:
         if b in df.columns:
             df[b] = df[b].astype(str).str.lower().map({"true": True, "false": False})
+
+    # SPARK from Tags
+    df["SPARK"] = df["Tags"].apply(classify_spark) if "Tags" in df.columns else "Unclassified"
 
     return df
 
@@ -144,7 +181,6 @@ df = prepare_data(raw_df)
 # Sidebar Filters
 # =========================
 st.sidebar.header("🔍 Filters")
-
 branch_options = sorted(df["Branch Name"].dropna().unique()) if "Branch Name" in df.columns else []
 feedback_options = sorted(df["Feedback Head"].dropna().unique()) if "Feedback Head" in df.columns else []
 shift_options = [s for s in ["Breakfast", "Lunch", "Dinner", "Late Night"] if "Shift" in df.columns and s in df["Shift"].unique()]
@@ -169,6 +205,10 @@ if sel_shifts and "Shift" in filtered.columns:
 if "Date" in filtered.columns and len(sel_dates) == 2:
     filtered = filtered[(filtered["Date"] >= sel_dates[0]) & (filtered["Date"] <= sel_dates[1])]
 
+# Remove "Not Responding" entries globally
+if "Tags" in filtered.columns:
+    filtered = filtered[~filtered["Tags"].str.contains(r"\bNot Responding\b", case=False, na=False)]
+
 # =========================
 # Helpers
 # =========================
@@ -177,6 +217,16 @@ def safe_count(frame: pd.DataFrame) -> int:
 
 def pct(n: float, d: float) -> float:
     return (100.0 * n / d) if d else 0.0
+
+def compute_nps(df_part: pd.DataFrame) -> float:
+    if "Feedback Head" not in df_part.columns or df_part.empty:
+        return 0.0
+    total = len(df_part)
+    if total == 0:
+        return 0.0
+    promoters = (df_part["Feedback Head"] == "Promoter").sum()
+    demoters = (df_part["Feedback Head"] == "Demoter").sum()
+    return (promoters/total*100.0) - (demoters/total*100.0)
 
 # =========================
 # Tabs
@@ -202,17 +252,19 @@ with tabs[0]:
     demoters = int((filtered["Feedback Head"] == "Demoter").sum()) if "Feedback Head" in filtered.columns else 0
     promoters = int((filtered["Feedback Head"] == "Promoter").sum()) if "Feedback Head" in filtered.columns else 0
     neutrals = int((filtered["Feedback Head"] == "Neutral").sum()) if "Feedback Head" in filtered.columns else 0
+    nps_all = compute_nps(filtered)
 
     sla_breach = int(filtered.get("SLA Breach", pd.Series([False]*len(filtered))).fillna(False).sum()) if "SLA Breach" in filtered.columns else 0
     reopened = int(filtered.get("Re-Opened", pd.Series([False]*len(filtered))).fillna(False).sum()) if "Re-Opened" in filtered.columns else 0
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("Total Responses", total_responses)
     c2.metric("Promoter %", f"{pct(promoters, total_responses):.1f}%")
     c3.metric("Demoter %", f"{pct(demoters, total_responses):.1f}%")
     c4.metric("Neutral %", f"{pct(neutrals, total_responses):.1f}%")
-    c5.metric("SLA Breach %", f"{pct(sla_breach, total_responses):.1f}%")
-    c6.metric("Reopen %", f"{pct(reopened, total_responses):.1f}%")
+    c5.metric("NPS", f"{nps_all:.1f}")
+    c6.metric("SLA Breach %", f"{pct(sla_breach, total_responses):.1f}%")
+    c7.metric("Reopen %", f"{pct(reopened, total_responses):.1f}%")
 
     if "Branch Name" in filtered.columns:
         st.subheader("📍 Responses by Branch")
@@ -243,15 +295,17 @@ with tabs[0]:
 with tabs[1]:
     st.title("🗓️ Time Intelligence")
 
-    # Weekday vs Weekend (with Demoter % line)
+    # Weekday vs Weekend volume + Demoter %
     if set(["IsWeekend", "Feedback Head", "Ticket number"]).issubset(filtered.columns):
         tmp = filtered.copy()
         tmp["DayType"] = tmp["IsWeekend"].apply(lambda x: "Weekend" if x else "Weekday")
         daytype = tmp.groupby("DayType").agg(
             Responses=("Ticket number", "count"),
-            Demoters=("Feedback Head", lambda s: (s == "Demoter").sum())
+            Demoters=("Feedback Head", lambda s: (s == "Demoter").sum()),
+            Promoters=("Feedback Head", lambda s: (s == "Promoter").sum()),
         ).reset_index()
         daytype["Demoter %"] = daytype["Demoters"] / daytype["Responses"] * 100.0
+        daytype["NPS"] = (daytype["Promoters"]/daytype["Responses"]*100.0) - (daytype["Demoters"]/daytype["Responses"]*100.0)
 
         bar = go.Bar(x=daytype["DayType"], y=daytype["Responses"], name="Responses", marker_color="#219EBC")
         line = go.Scatter(x=daytype["DayType"], y=daytype["Demoter %"], name="Demoter %", yaxis="y2", mode="lines+markers")
@@ -263,6 +317,15 @@ with tabs[1]:
             legend=dict(orientation="h")
         )
         st.plotly_chart(fig_combo, use_container_width=True)
+
+        # Weekday vs Weekend NPS
+        fig_nps_dw = px.bar(
+            daytype, x="DayType", y="NPS",
+            title="📅 Weekday vs Weekend NPS",
+            text=daytype["NPS"].round(1)
+        )
+        fig_nps_dw.update_layout(xaxis_title="", yaxis_title="NPS")
+        st.plotly_chart(fig_nps_dw, use_container_width=True)
 
     # Day of Week profile
     if "DayOfWeek" in filtered.columns:
@@ -280,7 +343,7 @@ with tabs[1]:
         fig_heat = px.imshow(intraday_pivot, color_continuous_scale="YlOrRd", title="🔥 Intraday Responses Heatmap (Hour × Day)")
         st.plotly_chart(fig_heat, use_container_width=True)
 
-    # ✅ Weekly Response Trend using ISO weeks + real date axis
+    # Weekly Response Trend (ISO)
     if set(["WeekStart", "ISO_Year", "ISO_Week", "Ticket number"]).issubset(filtered.columns):
         wk = (filtered
               .dropna(subset=["WeekStart"])
@@ -288,18 +351,65 @@ with tabs[1]:
               .size()
               .reset_index(name="Responses")
               .sort_values("WeekStart"))
-
         wk["WeekLabel"] = wk["ISO_Year"].astype(str) + "-W" + wk["ISO_Week"].astype(str).str.zfill(2)
-
         fig_weekly = px.line(
             wk, x="WeekStart", y="Responses", markers=True,
             hover_data={"WeekStart": False, "WeekLabel": True, "ISO_Year": False, "ISO_Week": False}
         )
         fig_weekly.update_layout(title="🗓 Weekly Response Trend (ISO weeks, Monday start)",
                                  xaxis_title="Week (Mon start)", yaxis_title="Responses")
-        # If you prefer ISO labels as ticks, uncomment:
-        # fig_weekly.update_xaxes(tickmode="array", tickvals=wk["WeekStart"], ticktext=wk["WeekLabel"])
         st.plotly_chart(fig_weekly, use_container_width=True)
+
+    # Shift-wise NPS + volumes (with time slots)
+    if set(["Shift","Feedback Head","Ticket number"]).issubset(filtered.columns):
+        nps_shift = (
+            filtered.groupby("Shift").agg(
+                Responses=("Ticket number","count"),
+                Promoters=("Feedback Head", lambda s: (s=="Promoter").sum()),
+                Demoters=("Feedback Head", lambda s: (s=="Demoter").sum())
+            ).reset_index()
+        )
+        nps_shift["NPS"] = (nps_shift["Promoters"] / nps_shift["Responses"] * 100.0) - \
+                           (nps_shift["Demoters"] / nps_shift["Responses"] * 100.0)
+        nps_shift["Shift (Time)"] = nps_shift["Shift"].map(lambda s: f"{s} ({SHIFT_TIMES.get(s,'')})")
+
+        fig_nps_shift = px.bar(
+            nps_shift.sort_values("NPS", ascending=False),
+            x="Shift (Time)", y="NPS",
+            title="⭐ Shift-wise NPS (Promoters% − Demoters%)",
+            text=nps_shift["NPS"].round(1)
+        )
+        fig_nps_shift.update_layout(xaxis_title="Shift (with time slot)", yaxis_title="NPS")
+        st.plotly_chart(fig_nps_shift, use_container_width=True)
+
+        fig_vol_shift = px.bar(
+            nps_shift.sort_values("Responses", ascending=False),
+            x="Shift (Time)", y="Responses",
+            title="📦 Shift-wise Responses (volume)",
+            text="Responses"
+        )
+        fig_vol_shift.update_layout(xaxis_title="Shift (with time slot)", yaxis_title="Responses")
+        st.plotly_chart(fig_vol_shift, use_container_width=True)
+
+        # Best performing days & shifts (by NPS) with minimum volume
+        MIN_RESP = 30
+        if set(["DayOfWeek","Feedback Head","Ticket number"]).issubset(filtered.columns):
+            dow_nps = (
+                filtered.groupby("DayOfWeek").agg(
+                    Responses=("Ticket number","count"),
+                    Promoters=("Feedback Head", lambda s: (s=="Promoter").sum()),
+                    Demoters=("Feedback Head", lambda s: (s=="Demoter").sum())
+                ).reset_index()
+            )
+            dow_nps["NPS"] = (dow_nps["Promoters"]/dow_nps["Responses"]*100.0) - (dow_nps["Demoters"]/dow_nps["Responses"]*100.0)
+            best_days = dow_nps.query("Responses >= @MIN_RESP").sort_values("NPS", ascending=False)
+            st.subheader("🏆 Best Performing Days (by NPS)")
+            st.dataframe(best_days, use_container_width=True)
+
+        best_shifts = nps_shift.query("Responses >= @MIN_RESP").sort_values("NPS", ascending=False).copy()
+        best_shifts["Shift (Time)"] = best_shifts["Shift"].map(lambda s: f"{s} ({SHIFT_TIMES.get(s,'')})")
+        st.subheader("🏆 Best Performing Shifts (by NPS)")
+        st.dataframe(best_shifts[["Shift (Time)","Responses","NPS","Promoters","Demoters"]], use_container_width=True)
 
 # ======================================================
 # 3) LIFECYCLE & SLA
@@ -307,7 +417,6 @@ with tabs[1]:
 with tabs[2]:
     st.title("⏱️ Lifecycle & SLA")
 
-    # Funnel (Created → First Reply → Closed → Re-Opened)
     created_cnt = safe_count(filtered)
     first_reply_cnt = int(filtered["First Public Reply At"].notna().sum()) if "First Public Reply At" in filtered.columns else 0
     closed_cnt = int(filtered["Closed At"].notna().sum()) if "Closed At" in filtered.columns else 0
@@ -320,19 +429,16 @@ with tabs[2]:
     fig_fun = px.funnel(funnel_df, x="Count", y="Stage", title="🎯 Ticket Funnel")
     st.plotly_chart(fig_fun, use_container_width=True)
 
-    # FRT distribution
     if "FRT_min" in filtered.columns and filtered["FRT_min"].notna().sum() > 0:
         fig_frt = px.histogram(filtered, x="FRT_min", nbins=50, title="⏱ First Response Time (minutes) – Distribution")
         fig_frt.add_vline(x=np.nanmedian(filtered["FRT_min"]), line_dash="dash", annotation_text="Median", annotation_position="top")
         st.plotly_chart(fig_frt, use_container_width=True)
 
-    # TTR distribution
     if "TTR_min" in filtered.columns and filtered["TTR_min"].notna().sum() > 0:
         fig_ttr = px.histogram(filtered, x="TTR_min", nbins=50, title="🛠️ Resolution Time (minutes) – Distribution")
         fig_ttr.add_vline(x=np.nanmedian(filtered["TTR_min"]), line_dash="dash", annotation_text="Median", annotation_position="top")
         st.plotly_chart(fig_ttr, use_container_width=True)
 
-    # SLA heatmaps (by Branch and by Shift)
     if "SLA Breach" in filtered.columns:
         if "Branch Name" in filtered.columns:
             sla_branch = filtered.pivot_table(index="Branch Name", values="SLA Breach",
@@ -348,7 +454,6 @@ with tabs[2]:
             fig_sla_s = px.imshow(sla_shift, color_continuous_scale="Reds", title="🚨 SLA Breach % by Shift", text_auto=".1f")
             st.plotly_chart(fig_sla_s, use_container_width=True)
 
-    # Reopen analysis
     if set(["Re-Opened","Branch Name"]).issubset(filtered.columns):
         reopen_by_branch = filtered.groupby("Branch Name")["Re-Opened"].apply(lambda s: np.mean(s.fillna(False))*100).reset_index(name="Reopen %")
         fig_ro = px.bar(reopen_by_branch.sort_values("Reopen %", ascending=False), x="Branch Name", y="Reopen %",
@@ -390,14 +495,9 @@ with tabs[3]:
                             title="Sentiment Breakdown by Tag", text="Count")
             st.plotly_chart(fig_st, use_container_width=True)
 
-    # N-gram bars + WordCloud + Bullet Insights
+    # Text mining
     st.subheader("📝 Text Mining on Descriptions")
-    if "Description" in filtered.columns:
-        text_series = filtered["Description"].dropna().astype(str)
-        text = " ".join(text_series) if not text_series.empty else ""
-    else:
-        text = ""
-
+    text = " ".join(filtered["Description"].dropna().astype(str)) if "Description" in filtered.columns else ""
     if text.strip():
         wc = WordCloud(width=900, height=400, background_color="white").generate(text)
         fig_wc, ax = plt.subplots(figsize=(10, 4))
@@ -411,7 +511,6 @@ with tabs[3]:
         bigrams = [" ".join(p) for p in zip(tokens, tokens[1:])]
         trigrams = [" ".join((tokens[i], tokens[i+1], tokens[i+2])) for i in range(len(tokens)-2)]
 
-        from collections import Counter
         bi_df = pd.DataFrame(Counter(bigrams).most_common(15), columns=["bigram","count"])
         tri_df = pd.DataFrame(Counter(trigrams).most_common(15), columns=["trigram","count"])
 
@@ -434,12 +533,27 @@ with tabs[3]:
         if any(w in common_terms for w in ["fries","burger","drink"]): insights.append("Product-specific feedback (fries/burger/drinks) — focus recipe adherence & batch timing.")
         if not insights:
             insights.append("No dominant repeating theme detected — responses are dispersed.")
-
         st.markdown("### 🧠 Key Insights from Responses")
         for p in insights:
             st.markdown(f"- {p}")
-    else:
-        st.info("No response descriptions found for text analysis.")
+
+    # SPARK visuals
+    if "SPARK" in filtered.columns:
+        st.subheader("⚡ SPARK Breakdown (Top Drivers)")
+        spark_counts = filtered["SPARK"].value_counts().reset_index()
+        spark_counts.columns = ["SPARK", "Responses"]
+        fig_spark = px.bar(spark_counts, x="Responses", y="SPARK", orientation="h", text="Responses",
+                           title="SPARK Categories by Volume")
+        st.plotly_chart(fig_spark, use_container_width=True)
+
+        if "Shift" in filtered.columns:
+            spark_shift = filtered.groupby(["SPARK","Shift"]).size().reset_index(name="Responses")
+            spark_shift["Shift (Time)"] = spark_shift["Shift"].map(lambda s: f"{s} ({SHIFT_TIMES.get(s,'')})")
+            fig_spark_shift = px.bar(
+                spark_shift, x="Responses", y="SPARK", color="Shift (Time)",
+                orientation="h", barmode="group", title="SPARK by Shift"
+            )
+            st.plotly_chart(fig_spark_shift, use_container_width=True)
 
 # ======================================================
 # 5) BRANCH & AGENT
@@ -447,24 +561,19 @@ with tabs[3]:
 with tabs[4]:
     st.title("🏪 Branch & 👤 Agent Analytics")
 
-    # Branch KPI table
     frames = []
     if "Branch Name" in filtered.columns and "Feedback Head" in filtered.columns:
         demoter_rate = filtered.groupby("Branch Name")["Feedback Head"].apply(lambda s: (s == "Demoter").mean()*100).reset_index(name="Demoter %")
         frames.append(demoter_rate)
-
     if "SLA Breach" in filtered.columns and "Branch Name" in filtered.columns:
         sla_rate = filtered.groupby("Branch Name")["SLA Breach"].apply(lambda s: np.mean(s.fillna(False))*100).reset_index(name="SLA Breach %")
         frames.append(sla_rate)
-
     if "Re-Opened" in filtered.columns and "Branch Name" in filtered.columns:
         reopen_rate = filtered.groupby("Branch Name")["Re-Opened"].apply(lambda s: np.mean(s.fillna(False))*100).reset_index(name="Re-Opened %")
         frames.append(reopen_rate)
-
     if "Branch Name" in filtered.columns and "FRT_min" in filtered.columns:
         frt_median = filtered.groupby("Branch Name")["FRT_min"].median().reset_index(name="Median FRT (min)")
         frames.append(frt_median)
-
     if "Branch Name" in filtered.columns and "TTR_min" in filtered.columns:
         ttr_median = filtered.groupby("Branch Name")["TTR_min"].median().reset_index(name="Median TTR (min)")
         frames.append(ttr_median)
@@ -478,7 +587,6 @@ with tabs[4]:
     else:
         st.info("Not enough columns to compute branch KPIs.")
 
-    # Agent productivity vs quality
     if set(["Team Member","Ticket number"]).issubset(filtered.columns):
         agent_agg = filtered.groupby("Team Member").agg(
             Responses=("Ticket number","count"),
@@ -490,7 +598,6 @@ with tabs[4]:
                                hover_data=["Team Member"], title="👤 Agent Throughput vs Resolution Time (color=Demoter %)")
         st.plotly_chart(fig_agent, use_container_width=True)
 
-    # Workload vs SLA (bubble)
     if set(["Team Member","SLA Breach","Ticket number"]).issubset(filtered.columns):
         workload = filtered.groupby("Team Member").agg(
             Responses=("Ticket number","count"),
@@ -511,10 +618,10 @@ with tabs[5]:
             Responses=("Ticket number","count"),
             Demoters=("Feedback Head", lambda s: (s=="Demoter").sum()) if "Feedback Head" in filtered.columns else ("Ticket number","count")
         ).reset_index()
-        if not daily.empty:
-            daily["Demoter %"] = (daily["Demoters"]/daily["Responses"]*100) if "Feedback Head" in filtered.columns else 0
-            mu = daily["Demoter %"].mean() if "Feedback Head" in filtered.columns else 0
-            sigma = daily["Demoter %"].std(ddof=1) if "Feedback Head" in filtered.columns else 0
+        if not daily.empty and "Feedback Head" in filtered.columns:
+            daily["Demoter %"] = daily["Demoters"]/daily["Responses"]*100
+            mu = daily["Demoter %"].mean()
+            sigma = daily["Demoter %"].std(ddof=1)
             ucl, lcl = mu + 3*sigma, max(mu - 3*sigma, 0)
 
             fig_cc = go.Figure()
@@ -525,7 +632,6 @@ with tabs[5]:
             fig_cc.update_layout(title="📉 Control Chart – Daily Demoter %")
             st.plotly_chart(fig_cc, use_container_width=True)
 
-    # Outlier explorer (top 1% TTR or FRT)
     out = filtered.copy()
     out["Outlier"] = False
     if "TTR_min" in out.columns and out["TTR_min"].notna().sum() > 0:
