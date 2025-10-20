@@ -840,5 +840,3 @@ with tabs[7]:
                 st.info("No suitable columns available to display excluded rows.")
         else:
             st.success("No Demoter rows with 'Not Responding' were found.")
-
-st.caption("© 2025 Johnny & Jugnu | Built by Arbaz Mubasher — Streamlit + Plotly + pandas")
