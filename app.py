@@ -207,6 +207,25 @@ if "Date" in filtered.columns and len(sel_dates) == 2:
     filtered = filtered[(filtered["Date"] >= sel_dates[0]) & (filtered["Date"] <= sel_dates[1])]
 
 # =========================
+# Exclusion of Demoters with "Not Responding" in Tags — DISABLED (keep all data)
+# =========================
+pre_analysis_df = filtered.copy()  # snapshot before any exclusions (we won't exclude now)
+
+# No rows are excluded anymore
+excluded_mask = pd.Series(False, index=filtered.index)
+excluded_count = 0
+
+# Keep filtered as-is (NO filtering)
+# filtered = filtered[~excluded_mask].copy()  # ← removed
+
+# Save audit payload for the tab (shows zero exclusions)
+audit_payload = {
+    "pre": pre_analysis_df,
+    "post": filtered.copy(),
+    "mask": excluded_mask,
+    "count": excluded_count,
+}
+# =========================
 # Helpers
 # =========================
 def safe_count(frame: pd.DataFrame) -> int:
@@ -225,18 +244,6 @@ def compute_nps(df_part: pd.DataFrame) -> float:
     if base == 0:
         return 0.0
     return (p / base * 100.0) - (d / base * 100.0)
-
-# Robust matcher for "not responding" family
-def not_responding_mask(series: pd.Series) -> pd.Series:
-    s = series.fillna("").astype(str).str.lower()
-    pat = (
-        r"(?:\bnot\s*respond(?:ing|ed)?\b)|"
-        r"(?:\bno\s*response\b)|"
-        r"(?:\bnot\s*answer(?:ing|ed)?\b)|"
-        r"(?:\bno\s*answer\b)|"
-        r"(?:\bnot\s*picking\b)"
-    )
-    return s.str.contains(pat, regex=True)
 
 # =========================
 # Tabs
@@ -264,22 +271,10 @@ with tabs[0]:
     neutrals = int((filtered["Feedback Head"] == "Neutral").sum()) if "Feedback Head" in filtered.columns else 0
     nps_all = compute_nps(filtered)
 
-    # Demoters tagged as not responding (kept in analysis)
-    demoter_nr = 0
-    rootcause_covered = 0.0
-    if set(["Feedback Head", "Tags"]).issubset(filtered.columns):
-        demoter_mask = filtered["Feedback Head"].astype(str).str.strip().str.lower().eq("demoter")
-        nr_mask = not_responding_mask(filtered["Tags"])
-        demoter_nr = int((demoter_mask & nr_mask).sum())
-        demoter_total = int(demoter_mask.sum())
-        # Root-cause coverage among demoters (i.e., demoters that are NOT "not responding")
-        if demoter_total > 0:
-            rootcause_covered = 100.0 * (demoter_total - demoter_nr) / demoter_total
-
     sla_breach = int(filtered.get("SLA Breach", pd.Series([False]*len(filtered))).fillna(False).sum()) if "SLA Breach" in filtered.columns else 0
     reopened = int(filtered.get("Re-Opened", pd.Series([False]*len(filtered))).fillna(False).sum()) if "Re-Opened" in filtered.columns else 0
 
-    c1, c2, c3, c4, c5, c6, c7, c8, c9 = st.columns(9)
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("Total Responses", total_responses)
     c2.metric("Promoter %", f"{pct(promoters, total_responses):.1f}%")
     c3.metric("Demoter %", f"{pct(demoters, total_responses):.1f}%")
@@ -287,8 +282,6 @@ with tabs[0]:
     c5.metric("NPS", f"{nps_all:.1f}")
     c6.metric("SLA Breach %", f"{pct(sla_breach, total_responses):.1f}%")
     c7.metric("Reopen %", f"{pct(reopened, total_responses):.1f}%")
-    c8.metric("Demoters tagged Not Responding", demoter_nr)
-    c9.metric("Root-cause coverage among Demoters", f"{rootcause_covered:.1f}%")
 
     if "Branch Name" in filtered.columns:
         st.subheader("Responses by Branch")
@@ -678,7 +671,7 @@ with tabs[4]:
 
     if frames:
         branch_kpis = frames[0]
-        for f in frames[1:] :
+        for f in frames[1:]:
             branch_kpis = branch_kpis.merge(f, how="outer", on="Branch Name")
         branch_kpis = branch_kpis.fillna(0).rename(columns={"Branch Name": "Branch"})
         st.dataframe(branch_kpis.sort_values("Demoter %", ascending=False), use_container_width=True)
@@ -794,13 +787,53 @@ with tabs[6]:
 # 8) CLASSIFICATION AUDIT
 # ======================================================
 with tabs[7]:
-    st.title("Classification Audit — Demoter cases with 'Not Responding' tag")
+    st.title("Exclusions Audit — Demoter with 'Not Responding'")
 
-    if set(["Feedback Head","Tags"]).issubset(df.columns):
-        # Build audit on the same branch/shift/date filters, but do not apply a Feedback filter here
-        audit_df = df.copy()
-        if sel_branches and "Branch Name" in audit_df.columns:
-            audit_df = audit_df[audit_df["Branch Name"].isin(sel_branches)]
-        if sel_shifts and "Shift" in audit_df.columns:
-            audit_df = audit_df[audit_df["Shift"].isin(sel_shifts)]
-        if "Date" in audit_df.columns and len(sel_dates) == 
+    if "audit_payload" not in locals():
+        st.info("No audit payload available.")
+    else:
+        pre = audit_payload["pre"]
+        post = audit_payload["post"]
+        mask = audit_payload["mask"]
+        excl_count = audit_payload["count"]
+
+        st.metric("Rows excluded (Demoter AND 'Not Responding')", excl_count)
+
+        if excl_count > 0:
+            affected = pre.loc[mask].copy()
+
+            if "Branch Name" in affected.columns:
+                st.subheader("Excluded by Branch")
+                b = affected["Branch Name"].value_counts().reset_index()
+                b.columns = ["Branch", "Count"]
+                fig_b = px.bar(b, x="Count", y="Branch", orientation="h", text="Count",
+                               title="Excluded (Demoter + 'Not Responding') by Branch")
+                st.plotly_chart(fig_b, use_container_width=True)
+
+            if "Shift" in affected.columns:
+                st.subheader("Excluded by Shift")
+                s = affected["Shift"].value_counts().reset_index()
+                s.columns = ["Shift", "Count"]
+                s["Shift (Time)"] = s["Shift"].map(lambda x: f"{x} ({SHIFT_TIMES.get(x,'')})")
+                fig_s = px.bar(s, x="Count", y="Shift (Time)", orientation="h", text="Count",
+                               title="Excluded (Demoter + 'Not Responding') by Shift")
+                st.plotly_chart(fig_s, use_container_width=True)
+
+            if "WeekStart" in affected.columns:
+                st.subheader("Exclusions over Time (ISO Week)")
+                w = affected.groupby("WeekStart").size().reset_index(name="Count").sort_values("WeekStart")
+                fig_w = px.line(w, x="WeekStart", y="Count", markers=True, title="Weekly Count of Excluded Rows")
+                st.plotly_chart(fig_w, use_container_width=True)
+
+            st.subheader("Excluded Rows (details)")
+            cols = [c for c in [
+                "Ticket number","Created At","Branch Name","Shift","DayOfWeek",
+                "Tags","Feedback Head","Description"
+            ] if c in pre.columns]
+            if cols:
+                st.dataframe(affected[cols].sort_values("Created At").reset_index(drop=True),
+                             use_container_width=True, height=380)
+            else:
+                st.info("No suitable columns available to display excluded rows.")
+        else:
+            st.success("No Demoter rows with 'Not Responding' were found.")
