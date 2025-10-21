@@ -300,8 +300,8 @@ tabs = st.tabs([
     "Branch & Agent",
     "Customer Analysis",   # NEW
     "Risk & Stability",
-    "Data Quality",
-    "Classification Audit"
+    "Data Quality"
+    #"Classification Audit"
 ])
 
 # ======================================================
@@ -992,58 +992,3 @@ with tabs[7]:
         st.dataframe(sanity, use_container_width=True)
     else:
         st.info("No timestamp rules evaluated (required columns missing).")
-
-# ======================================================
-# 9) CLASSIFICATION AUDIT
-# ======================================================
-with tabs[8]:
-    st.title("Exclusions Audit — Demoter with 'Not Responding'")
-
-    if "audit_payload" not in locals():
-        st.info("No audit payload available.")
-    else:
-        pre = audit_payload["pre"]
-        post = audit_payload["post"]
-        mask = audit_payload["mask"]
-        excl_count = audit_payload["count"]
-
-        st.metric("Rows excluded (Demoter AND 'Not Responding')", excl_count)
-
-        if excl_count > 0:
-            affected = pre.loc[mask].copy()
-
-            if "Branch Name" in affected.columns:
-                st.subheader("Excluded by Branch")
-                b = affected["Branch Name"].value_counts().reset_index()
-                b.columns = ["Branch", "Count"]
-                fig_b = px.bar(b, x="Count", y="Branch", orientation="h", text="Count",
-                               title="Excluded (Demoter + 'Not Responding') by Branch")
-                st.plotly_chart(fig_b, use_container_width=True)
-
-            if "Shift" in affected.columns:
-                st.subheader("Excluded by Shift")
-                s = affected["Shift"].value_counts().reset_index()
-                s.columns = ["Shift", "Count"]
-                s["Shift (Time)"] = s["Shift"].map(lambda x: f"{x} ({SHIFT_TIMES.get(x,'')})")
-                fig_s = px.bar(s, x="Count", y="Shift (Time)", orientation="h", text="Count",
-                               title="Excluded (Demoter + 'Not Responding') by Shift")
-                st.plotly_chart(fig_s, use_container_width=True)
-
-            if "WeekStart" in affected.columns:
-                st.subheader("Exclusions over Time (ISO Week)")
-                w = affected.groupby("WeekStart").size().reset_index(name="Count").sort_values("WeekStart")
-                fig_w = px.line(w, x="WeekStart", y="Count", markers=True, title="Weekly Count of Excluded Rows")
-                st.plotly_chart(fig_w, use_container_width=True)
-
-            st.subheader("Excluded Rows (details)")
-            cols = [c for c in [
-                "Ticket number","Created At","Branch Name","Shift","DayOfWeek",
-                "Tags","Feedback Head","Description"
-            ] if c in pre.columns]
-            if cols:
-                st.dataframe(affected[cols].sort_values("Created At").reset_index(drop=True),
-                             use_container_width=True, height=380)
-            else:
-                st.info("No suitable columns available to display excluded rows.")
-        else:
-            st.success("No Demoter rows with 'Not Responding' were found.")
