@@ -7,9 +7,10 @@
 # 3) Lifecycle & SLA
 # 4) Themes & Text
 # 5) Branch & Agent
-# 6) Risk & Stability
-# 7) Data Quality
-# 8) Classification Audit
+# 6) Customer Analysis   <-- NEW
+# 7) Risk & Stability
+# 8) Data Quality
+# 9) Classification Audit
 # -------------------------------------------------------
 
 import os
@@ -24,6 +25,7 @@ import plotly.graph_objects as go
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
 from collections import Counter
+from typing import Optional
 
 # =========================
 # Page Config (MUST be first)
@@ -50,13 +52,17 @@ def classify_spark(tag: str) -> str:
         return "SPARK: Speed of Service"
 
     # Product Quality
-    if any(k in t for k in ["cold", "soggy", "undercooked", "overcooked", "raw", "oily", "unfresh",
-                            "dryness", "dry", "stale", "patty size", "burnt", "chicken item", "bakery item"]):
+    if any(k in t for k in [
+        "cold","soggy","undercooked","overcooked","raw","oily","unfresh","dryness","dry",
+        "stale","patty size","burnt","chicken item","bakery item"
+    ]):
         return "SPARK: Product Quality"
 
     # Accuracy
-    if any(k in t for k in ["wrong", "missed", "missing", "addons", "dip missed", "fries missed",
-                            "wrong product", "wrong sauce", "product missed"]):
+    if any(k in t for k in [
+        "wrong","missed","missing","addons","dip missed","fries missed",
+        "wrong product","wrong sauce","product missed"
+    ]):
         return "SPARK: Accuracy"
 
     # Relationship
@@ -72,7 +78,11 @@ def classify_spark(tag: str) -> str:
 # =========================
 # Data Source (Local ➜ Secrets URL ➜ Uploader)
 # =========================
-DATA_PATH = "cx9_tickets_1760606268482.xlsx"  # keep for local runs
+# Try a couple of local defaults (adjust as needed)
+DATA_PATH_CANDIDATES = [
+    "cx9_tickets_1760606268482.xlsx",
+    "/mnt/data/1234567.xlsx",  # user-uploaded path hint
+]
 
 def _read_excel_from_bytes(xls_bytes: bytes, preferred_sheet: str = "tickets") -> pd.DataFrame:
     xls = pd.ExcelFile(io.BytesIO(xls_bytes))
@@ -80,13 +90,17 @@ def _read_excel_from_bytes(xls_bytes: bytes, preferred_sheet: str = "tickets") -
     df = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=sheet)
     return df
 
-def _try_load_local(path: str) -> bytes | None:
-    if path and os.path.exists(path):
-        with open(path, "rb") as f:
-            return f.read()
+def _try_load_local() -> Optional[bytes]:
+    for path in DATA_PATH_CANDIDATES:
+        if path and os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    return f.read()
+            except Exception:
+                continue
     return None
 
-def _try_load_from_secret_url() -> bytes | None:
+def _try_load_from_secret_url() -> Optional[bytes]:
     try:
         url = st.secrets["data"]["url"]
         if not url:
@@ -102,7 +116,7 @@ def parse_excel_bytes(xls_bytes: bytes, preferred_sheet: str = "tickets") -> pd.
     return _read_excel_from_bytes(xls_bytes, preferred_sheet)
 
 def load_data(preferred_sheet: str = "tickets") -> pd.DataFrame:
-    xls_bytes = _try_load_local(DATA_PATH)
+    xls_bytes = _try_load_local()
     if xls_bytes is None:
         xls_bytes = _try_load_from_secret_url()
     if xls_bytes is None:
@@ -210,21 +224,15 @@ if "Date" in filtered.columns and len(sel_dates) == 2:
 # Exclusion of Demoters with "Not Responding" in Tags — DISABLED (keep all data)
 # =========================
 pre_analysis_df = filtered.copy()  # snapshot before any exclusions (we won't exclude now)
-
-# No rows are excluded anymore
 excluded_mask = pd.Series(False, index=filtered.index)
 excluded_count = 0
-
-# Keep filtered as-is (NO filtering)
-# filtered = filtered[~excluded_mask].copy()  # ← removed
-
-# Save audit payload for the tab (shows zero exclusions)
 audit_payload = {
     "pre": pre_analysis_df,
     "post": filtered.copy(),
     "mask": excluded_mask,
     "count": excluded_count,
 }
+
 # =========================
 # Helpers
 # =========================
@@ -246,6 +254,42 @@ def compute_nps(df_part: pd.DataFrame) -> float:
     return (p / base * 100.0) - (d / base * 100.0)
 
 # =========================
+# Field resolvers & phone utils (for Customer Analysis)
+# =========================
+POSSIBLE_PHONE_COLS = ["Customer Phone", "customer_phone", "Phone", "Phone Number", "Contact", "Contact Number"]
+POSSIBLE_NAME_COLS  = ["Customer Name", "customer_name", "Name"]
+POSSIBLE_ADDR_COLS  = ["Customer Address", "customer_address", "Address", "Location"]
+TICKET_ID_COLS      = ["Ticket number", "Ticket ID", "id", "ID"]
+
+def col_exists(frame: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+    for c in candidates:
+        if c in frame.columns:
+            return c
+    return None
+
+PHONE_COL  = col_exists(df, POSSIBLE_PHONE_COLS)
+NAME_COL   = col_exists(df, POSSIBLE_NAME_COLS)
+ADDR_COL   = col_exists(df, POSSIBLE_ADDR_COLS)
+TICKET_COL = col_exists(df, TICKET_ID_COLS)
+
+def digits_only(s: str) -> str:
+    return re.sub(r"\D+", "", s or "")
+
+def normalize_phone_series(s: pd.Series) -> pd.Series:
+    try:
+        return s.fillna("").astype(str).map(digits_only)
+    except Exception:
+        return pd.Series([""] * len(s))
+
+# Precompute normalized phones for both full and filtered frames (if present)
+if PHONE_COL:
+    df["_PhoneNorm"] = normalize_phone_series(df[PHONE_COL])
+    filtered["_PhoneNorm"] = normalize_phone_series(filtered[PHONE_COL])
+else:
+    df["_PhoneNorm"] = ""
+    filtered["_PhoneNorm"] = ""
+
+# =========================
 # Tabs
 # =========================
 tabs = st.tabs([
@@ -254,6 +298,7 @@ tabs = st.tabs([
     "Lifecycle & SLA",
     "Themes & Text",
     "Branch & Agent",
+    "Customer Analysis",   # NEW
     "Risk & Stability",
     "Data Quality",
     "Classification Audit"
@@ -482,10 +527,15 @@ with tabs[2]:
 with tabs[3]:
     st.title("Themes & Text Analysis")
 
+    # Compute topN tags once for reuse below
+    topN = 20
+    if "Tags" in filtered.columns:
+        top_tag_values = filtered["Tags"].value_counts().head(topN).index
+    else:
+        top_tag_values = pd.Index([])
+
     # Tag × Branch heatmap
     if set(["Tags","Branch Name","Ticket number"]).issubset(filtered.columns):
-        topN = 20
-        top_tag_values = filtered["Tags"].value_counts().head(topN).index
         tag_branch = filtered[filtered["Tags"].isin(top_tag_values)]
         if not tag_branch.empty:
             tb = tag_branch.pivot_table(index="Tags", columns="Branch Name", values="Ticket number",
@@ -495,7 +545,7 @@ with tabs[3]:
 
     # Tag × Shift heatmap
     if set(["Tags","Shift","Ticket number"]).issubset(filtered.columns):
-        tag_shift = filtered[filtered["Tags"].isin(topN and top_tag_values)]
+        tag_shift = filtered[filtered["Tags"].isin(top_tag_values)]
         if not tag_shift.empty:
             ts = tag_shift.pivot_table(index="Tags", columns="Shift", values="Ticket number",
                                        aggfunc="count", fill_value=0)
@@ -505,7 +555,7 @@ with tabs[3]:
 
     # Sentiment by Tag
     if set(["Tags","Feedback Head"]).issubset(filtered.columns):
-        sent_tag = filtered[filtered["Tags"].isin(topN and top_tag_values)].groupby(["Tags","Feedback Head"]).size().reset_index(name="Count")
+        sent_tag = filtered[filtered["Tags"].isin(top_tag_values)].groupby(["Tags","Feedback Head"]).size().reset_index(name="Count")
         if not sent_tag.empty:
             fig_st = px.bar(sent_tag, y="Tags", x="Count", color="Feedback Head", orientation="h", barmode="relative",
                             title="Sentiment Breakdown by Tag", text="Count")
@@ -699,9 +749,169 @@ with tabs[4]:
         st.plotly_chart(fig_wl, use_container_width=True)
 
 # ======================================================
-# 6) RISK & STABILITY
+# 6) CUSTOMER ANALYSIS (Customer CLI, Addresses, Complaints)
 # ======================================================
 with tabs[5]:
+    st.title("Customer Analysis")
+
+    if not PHONE_COL and not NAME_COL and not ADDR_COL:
+        st.info("No customer fields (phone/name/address) detected in your dataset.")
+    else:
+        st.caption("Tip: Filters on the left (branch, feedback, shift, dates) apply here as well.")
+
+        # ---------- Customer CLI ----------
+        st.subheader("Customer CLI")
+
+        c1, c2, c3 = st.columns([2, 2, 1])
+        with c1:
+            lookup_number = st.text_input("Lookup by phone (any format)", placeholder="e.g., 03001234567 or +92 300 1234567")
+        with c2:
+            lookup_name = st.text_input("…or lookup by name (contains)", placeholder="e.g., Ali Khan")
+        with c3:
+            go_btn = st.button("Lookup")
+
+        cust_subset = filtered.copy()
+
+        # Apply CLI lookup
+        if go_btn and (lookup_number or lookup_name):
+            if lookup_number and PHONE_COL:
+                norm = digits_only(lookup_number)
+                if norm:
+                    cust_subset = cust_subset[cust_subset["_PhoneNorm"].str.contains(norm, na=False)]
+            if lookup_name and NAME_COL:
+                name_q = lookup_name.strip().lower()
+                if name_q:
+                    cust_subset = cust_subset[cust_subset[NAME_COL].astype(str).str.lower().str.contains(name_q, na=False)]
+
+        # Summary KPIs for current selection
+        total_rows = safe_count(cust_subset)
+        promoters = int((cust_subset.get("Feedback Head", pd.Series())).eq("Promoter").sum()) if "Feedback Head" in cust_subset.columns else 0
+        demoters  = int((cust_subset.get("Feedback Head", pd.Series())).eq("Demoter").sum()) if "Feedback Head" in cust_subset.columns else 0
+        neutrals  = int((cust_subset.get("Feedback Head", pd.Series())).eq("Neutral").sum()) if "Feedback Head" in cust_subset.columns else 0
+        nps_sel   = compute_nps(cust_subset)
+
+        sla_breach = int(cust_subset.get("SLA Breach", pd.Series([False]*len(cust_subset))).fillna(False).sum()) if "SLA Breach" in cust_subset.columns else 0
+        reopened   = int(cust_subset.get("Re-Opened", pd.Series([False]*len(cust_subset))).fillna(False).sum()) if "Re-Opened" in cust_subset.columns else 0
+
+        k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
+        k1.metric("Rows (current selection)", total_rows)
+        k2.metric("Promoter %", f"{pct(promoters, total_rows):.1f}%")
+        k3.metric("Demoter %", f"{pct(demoters, total_rows):.1f}%")
+        k4.metric("Neutral %", f"{pct(neutrals, total_rows):.1f}%")
+        k5.metric("NPS", f"{nps_sel:.1f}")
+        k6.metric("SLA Breach %", f"{pct(sla_breach, total_rows):.1f}%")
+        k7.metric("Reopen %", f"{pct(reopened, total_rows):.1f}%")
+
+        # ---------- Per-customer rollups ----------
+        st.subheader("Per-Customer Rollup")
+
+        group_keys = []
+        if PHONE_COL: group_keys.append(PHONE_COL)
+        if NAME_COL and NAME_COL not in group_keys: group_keys.append(NAME_COL)
+
+        if group_keys:
+            agg_parts = {
+                "Rows": (TICKET_COL or "Date", "count"),
+                "Promoters": ("Feedback Head", lambda s: (s == "Promoter").sum()) if "Feedback Head" in cust_subset.columns else (TICKET_COL or "Date", "count"),
+                "Demoters":  ("Feedback Head", lambda s: (s == "Demoter").sum())  if "Feedback Head" in cust_subset.columns else (TICKET_COL or "Date", "count"),
+                "Neutrals":  ("Feedback Head", lambda s: (s == "Neutral").sum())  if "Feedback Head" in cust_subset.columns else (TICKET_COL or "Date", "count"),
+                "Median TTR (min)": ("TTR_min", "median") if "TTR_min" in cust_subset.columns else (TICKET_COL or "Date", "count"),
+                "Median FRT (min)": ("FRT_min", "median") if "FRT_min" in cust_subset.columns else (TICKET_COL or "Date", "count"),
+                "SLA Breach %": ("SLA Breach", lambda s: np.mean(s.fillna(False))*100) if "SLA Breach" in cust_subset.columns else (TICKET_COL or "Date", "count"),
+                "Reopen %": ("Re-Opened", lambda s: np.mean(s.fillna(False))*100) if "Re-Opened" in cust_subset.columns else (TICKET_COL or "Date", "count"),
+                "First Seen": ("Created At", "min") if "Created At" in cust_subset.columns else (TICKET_COL or "Date", "count"),
+                "Last Seen": ("Created At", "max") if "Created At" in cust_subset.columns else (TICKET_COL or "Date", "count"),
+            }
+
+            roll = cust_subset.groupby(group_keys).agg(**agg_parts).reset_index()
+            if "Promoters" in roll.columns and "Demoters" in roll.columns and "Rows" in roll.columns:
+                roll["NPS"] = (roll["Promoters"]/roll["Rows"]*100.0) - (roll["Demoters"]/roll["Rows"]*100.0)
+            show_cols = [c for c in group_keys + ["Rows","NPS","Promoters","Demoters","Neutrals","Median TTR (min)","Median FRT (min)","SLA Breach %","Reopen %","First Seen","Last Seen"] if c in roll.columns]
+            st.dataframe(roll.sort_values(["Rows","Last Seen"], ascending=[False, False])[show_cols], use_container_width=True, height=420)
+        else:
+            st.info("No phone or name column found to build per-customer rollups.")
+
+        # ---------- Address Hotspots ----------
+        st.subheader("Address Hotspots & Complaints")
+        if ADDR_COL:
+            addr_agg = cust_subset.groupby(ADDR_COL).agg(
+                Rows=(TICKET_COL or "Date", "count"),
+                Demoters=("Feedback Head", lambda s: (s=="Demoter").sum()) if "Feedback Head" in cust_subset.columns else (TICKET_COL or "Date", "count")
+            ).reset_index()
+            if "Demoters" in addr_agg.columns:
+                addr_agg["Demoter %"] = addr_agg["Demoters"]/addr_agg["Rows"]*100.0
+            # Top 20 by volume
+            top_addr = addr_agg.sort_values("Rows", ascending=False).head(20)
+            fig_addr_vol = px.bar(top_addr, x="Rows", y=ADDR_COL, orientation="h", text="Rows", title="Top Addresses by Volume (Top 20)")
+            st.plotly_chart(fig_addr_vol, use_container_width=True)
+
+            # Worst 20 by Demoter % with min volume threshold
+            if "Demoter %" in addr_agg.columns:
+                MIN_ROWS = st.slider("Minimum rows for 'high demoter%' addresses", 5, 100, 10, help="Only consider addresses with at least this many rows")
+                worst_addr = addr_agg.query("Rows >= @MIN_ROWS").sort_values("Demoter %", ascending=False).head(20)
+                fig_addr_dem = px.bar(worst_addr, x="Demoter %", y=ADDR_COL, orientation="h", text=worst_addr["Demoter %"].round(1),
+                                      title=f"Worst Addresses by Demoter % (min {MIN_ROWS} rows)")
+                st.plotly_chart(fig_addr_dem, use_container_width=True)
+        else:
+            st.info("No address column found; skipping address hotspot analysis.")
+
+        # ---------- Complaints by Customer & Address ----------
+        st.subheader("Complaint Themes (Tags) by Customer / Address")
+        if "Tags" in cust_subset.columns:
+            left, right = st.columns(2)
+
+            with left:
+                st.markdown("**Top Complaint Tags (Current Selection)**")
+                tag_counts = cust_subset["Tags"].value_counts().head(20).reset_index()
+                tag_counts.columns = ["Tag", "Count"]
+                if not tag_counts.empty:
+                    fig_tag = px.bar(tag_counts, x="Count", y="Tag", orientation="h", text="Count", title="Top 20 Tags")
+                    st.plotly_chart(fig_tag, use_container_width=True)
+                st.dataframe(tag_counts, use_container_width=True, height=320)
+
+            with right:
+                if ADDR_COL:
+                    st.markdown("**Tags × Address (heatmap)**")
+                    top_tags_heat = cust_subset["Tags"].value_counts().head(15).index
+                    tmp = cust_subset[cust_subset["Tags"].isin(top_tags_heat)]
+                    if not tmp.empty:
+                        mat = tmp.pivot_table(index="Tags", columns=ADDR_COL, values=TICKET_COL or "Date", aggfunc="count", fill_value=0)
+                        top_addr_cols = cust_subset[ADDR_COL].value_counts().head(10).index
+                        mat = mat.reindex(columns=top_addr_cols, fill_value=0)
+                        fig_heat = px.imshow(mat, color_continuous_scale="YlOrRd", title="Tags × Address (Top 15 Tags × Top 10 Addresses)")
+                        st.plotly_chart(fig_heat, use_container_width=True)
+                else:
+                    st.info("Address column not available for Tags × Address heatmap.")
+
+        # ---------- Customer timeline (if a single customer selected) ----------
+        st.subheader("Customer Timeline (if single customer match)")
+        single_mask = False
+        if go_btn and lookup_number and PHONE_COL:
+            uniq_phones = cust_subset["_PhoneNorm"].dropna().unique()
+            if len(uniq_phones) == 1:
+                single_mask = True
+                one = cust_subset.sort_values("Created At")
+        elif go_btn and lookup_name and NAME_COL:
+            uniq_names = cust_subset[NAME_COL].dropna().unique()
+            if len(uniq_names) == 1:
+                single_mask = True
+                one = cust_subset.sort_values("Created At")
+
+        if single_mask:
+            if "Created At" in one.columns:
+                tl = one.groupby(one["Created At"].dt.date).size().reset_index(name="Rows")
+                fig_tl = px.line(tl, x="Created At", y="Rows", markers=True, title="Chronological Ticket Counts")
+                st.plotly_chart(fig_tl, use_container_width=True)
+
+            cols = [c for c in [TICKET_COL,"Created At","Branch Name","Tags","Feedback Head","Description","SLA Breach","Re-Opened","TTR_min","FRT_min"] if c in one.columns]
+            st.dataframe(one[cols].tail(25), use_container_width=True, height=360)
+        else:
+            st.caption("Select a single phone or name to see a per-customer timeline.")
+
+# ======================================================
+# 7) RISK & STABILITY
+# ======================================================
+with tabs[6]:
     st.title("Risk & Stability (SPC & Outliers)")
 
     if set(["Date","Ticket number"]).issubset(filtered.columns):
@@ -740,9 +950,9 @@ with tabs[5]:
         st.info("Not enough columns to render outlier table.")
 
 # ======================================================
-# 7) DATA QUALITY
+# 8) DATA QUALITY
 # ======================================================
-with tabs[6]:
+with tabs[7]:
     st.title("Data Quality & Governance")
 
     key_cols = [
@@ -784,9 +994,9 @@ with tabs[6]:
         st.info("No timestamp rules evaluated (required columns missing).")
 
 # ======================================================
-# 8) CLASSIFICATION AUDIT
+# 9) CLASSIFICATION AUDIT
 # ======================================================
-with tabs[7]:
+with tabs[8]:
     st.title("Exclusions Audit — Demoter with 'Not Responding'")
 
     if "audit_payload" not in locals():
