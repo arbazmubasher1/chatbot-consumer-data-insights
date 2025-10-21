@@ -845,79 +845,91 @@ with tabs[5]:
 
 
 
-        # ---------- Repeat Customers by Branch (Top Numbers) ----------
-        st.subheader("Repeat Customers by Branch (Top Numbers)")
+        # ---------- Repeat Customers by Branch ----------
+        st.subheader("Repeat Customers by Branch")
 
         if PHONE_COL and "_PhoneNorm" in cust_subset.columns and "Branch Name" in cust_subset.columns:
-            rep = cust_subset.copy()
+            # Keep rows with a usable phone
+            mm = cust_subset.copy()
+            mm["_PhoneNorm"] = mm["_PhoneNorm"].replace("", np.nan)
+            mm = mm.dropna(subset=["_PhoneNorm"])
 
-            # Build (Branch, Phone) pairs with counts & last seen
-            per_pair = rep.groupby(["Branch Name", "_PhoneNorm"]).agg(
-                Tickets=(TICKET_COL or "Date", "count"),
-                LastSeen=("Created At", "max") if "Created At" in rep.columns else (TICKET_COL or "Date", "count")
-            ).reset_index()
+            # visits per (Branch, Phone)
+            agg_cols = {"_PhoneNorm": "size"}
+            if "Created At" in mm.columns:
+                agg_cols.update({
+                    "Created At_min": ("Created At", "min"),
+                    "Created At_max": ("Created At", "max"),
+                })
 
-            # Summary: how many repeat customers per branch (>=2 tickets)
-            repeat_mask = per_pair["Tickets"] >= 2
-            branch_repeat = per_pair.groupby("Branch Name").agg(
-                UniqueCustomers=("_PhoneNorm", "nunique"),
-                RepeatCustomers=("_PhoneNorm", lambda s: per_pair.loc[(per_pair["Branch Name"] == s.name) & repeat_mask, "_PhoneNorm"].nunique())
-            ).reset_index()
-            branch_repeat["Repeat %"] = np.where(
-                branch_repeat["UniqueCustomers"] > 0,
-                branch_repeat["RepeatCustomers"] / branch_repeat["UniqueCustomers"] * 100.0,
-                0.0
-            )
+            pairs = mm.groupby(["Branch Name", "_PhoneNorm"]).agg(**({
+                "Visits": ("_PhoneNorm", "size"),
+                **({"FirstSeen": ("Created At", "min"), "LastSeen": ("Created At", "max")} if "Created At" in mm.columns else {})
+            })).reset_index()
 
-            cA, cB = st.columns(2)
-            with cA:
-                fig_rep_abs = px.bar(
-                    branch_repeat.sort_values("RepeatCustomers", ascending=False),
-                    x="RepeatCustomers", y="Branch Name", orientation="h", text="RepeatCustomers",
-                    title="Repeat Customers (count) by Branch"
+            # only phones with 2+ visits in same branch
+            repeats = pairs[pairs["Visits"] >= 2].copy()
+
+            if repeats.empty:
+                st.info("No repeat customers under the current filters.")
+            else:
+                # branch-level rollup
+                branch_roll = repeats.groupby("Branch Name").agg(
+                    RepeatCustomers=("_PhoneNorm", "nunique"),          # how many distinct repeat numbers
+                    TotalRepeatVisits=("Visits", "sum")                 # total visits among those repeat numbers
+                ).reset_index()
+
+                # add a simple 'avg repeat visits per repeat customer'
+                branch_roll["Avg Visits / Repeat Cust"] = (branch_roll["TotalRepeatVisits"] /
+                                                        branch_roll["RepeatCustomers"]).round(2)
+
+                left, right = st.columns([1,1])
+
+                with left:
+                    st.markdown("**Branches by count of repeat customers**")
+                    fig_rep = px.bar(
+                        branch_roll.sort_values("RepeatCustomers", ascending=False).head(20),
+                        x="RepeatCustomers", y="Branch Name", orientation="h", text="RepeatCustomers",
+                        title="Top Branches by Repeat Customers (Top 20)"
+                    )
+                    st.plotly_chart(fig_rep, use_container_width=True)
+                    st.dataframe(branch_roll.sort_values("RepeatCustomers", ascending=False),
+                                use_container_width=True, height=320)
+
+                with right:
+                    st.markdown("**Branches by total repeat visits**")
+                    fig_vis = px.bar(
+                        branch_roll.sort_values("TotalRepeatVisits", ascending=False).head(20),
+                        x="TotalRepeatVisits", y="Branch Name", orientation="h", text="TotalRepeatVisits",
+                        title="Top Branches by Total Repeat Visits (Top 20)"
+                    )
+                    st.plotly_chart(fig_vis, use_container_width=True)
+
+                # drill-in: pick a branch and see its top repeat numbers
+                st.markdown("**Drill-in: Top repeat numbers in a branch**")
+                sel_branch = st.selectbox(
+                    "Select branch to inspect",
+                    options=branch_roll.sort_values("RepeatCustomers", ascending=False)["Branch Name"].tolist()
                 )
-                st.plotly_chart(fig_rep_abs, use_container_width=True)
 
-            with cB:
-                fig_rep_pct = px.bar(
-                    branch_repeat.sort_values("Repeat %", ascending=False),
-                    x="Repeat %", y="Branch Name", orientation="h", text=branch_repeat["Repeat %"].round(1),
-                    title="Repeat Customers (% of unique) by Branch"
+                top_nums = (
+                    repeats[repeats["Branch Name"] == sel_branch]
+                    .sort_values("Visits", ascending=False)
+                    .copy()
                 )
-                st.plotly_chart(fig_rep_pct, use_container_width=True)
+                # optional: show last/first seen if available
+                show_cols = ["_PhoneNorm", "Visits"]
+                if "FirstSeen" in top_nums.columns: show_cols.append("FirstSeen")
+                if "LastSeen" in top_nums.columns: show_cols.append("LastSeen")
 
-            # Top N numbers per branch (ranked by ticket count)
-            st.markdown("**Top Numbers per Branch**")
-            TOP_N = st.slider("Show top N numbers per branch", 3, 20, 10, key="top_numbers_per_branch")
-            top_per_branch = (
-                per_pair.sort_values(["Branch Name", "Tickets", "LastSeen"], ascending=[True, False, False])
-                .groupby("Branch Name")
-                .head(TOP_N)
-                .reset_index(drop=True)
-                .rename(columns={"_PhoneNorm": "Customer CLI (normalized)"})
-            )
-
-            # Nice ordering: largest repeaters first
-            order_br = top_per_branch.groupby("Branch Name")["Tickets"].sum().sort_values(ascending=False).index
-            top_per_branch["Branch Name"] = pd.Categorical(top_per_branch["Branch Name"], categories=order_br, ordered=True)
-            st.dataframe(
-                top_per_branch.sort_values(["Branch Name", "Tickets"], ascending=[True, False]),
-                use_container_width=True, height=420
-            )
-
-            # Optional: visual “who repeats most” within each branch (faceted chart)
-            st.markdown("**Visual: Top Numbers within Each Branch**")
-            fig_facet = px.bar(
-                top_per_branch, x="Tickets", y="Customer CLI (normalized)",
-                orientation="h", facet_row="Branch Name",
-                title="Top Repeat Numbers per Branch",
-                height=min(1200, max(400, 120 * top_per_branch["Branch Name"].nunique()))
-            )
-            fig_facet.update_layout(showlegend=False)
-            st.plotly_chart(fig_facet, use_container_width=True)
-
+                st.dataframe(
+                    top_nums[["_PhoneNorm", "Visits"] + ([c for c in ["FirstSeen", "LastSeen"] if c in top_nums.columns])].head(50)
+                    .rename(columns={"_PhoneNorm": "Phone (normalized)"}),
+                    use_container_width=True, height=360
+                )
         else:
-            st.info("Phone column or Branch Name not available for repeat-customer grouping.")
+            st.info("This section needs a phone column (Customer CLI) and Branch Name.")
+
 
         # ---------- Address Hotspots ----------
         st.subheader("Address Hotspots & Complaints")
