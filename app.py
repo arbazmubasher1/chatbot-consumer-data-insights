@@ -7,7 +7,7 @@
 # 3) Lifecycle & SLA
 # 4) Themes & Text
 # 5) Branch & Agent
-# 6) Customer Analysis   <-- NEW
+# 6) Customer Analysis
 # 7) Risk & Stability
 # 8) Data Quality
 # 9) Classification Audit
@@ -78,10 +78,9 @@ def classify_spark(tag: str) -> str:
 # =========================
 # Data Source (Local ➜ Secrets URL ➜ Uploader)
 # =========================
-# Try a couple of local defaults (adjust as needed)
 DATA_PATH_CANDIDATES = [
     "cx9_tickets_1760606268482.xlsx",
-    "/mnt/data/1234567.xlsx",  # user-uploaded path hint
+    "/mnt/data/1234567.xlsx",  # your uploaded sample path
 ]
 
 def _read_excel_from_bytes(xls_bytes: bytes, preferred_sheet: str = "tickets") -> pd.DataFrame:
@@ -133,6 +132,9 @@ def load_data(preferred_sheet: str = "tickets") -> pd.DataFrame:
 @st.cache_data
 def prepare_data(raw: pd.DataFrame) -> pd.DataFrame:
     df = raw.copy()
+
+    # Trim accidental whitespace in headers
+    df.columns = [str(c).strip() for c in df.columns]
 
     # Parse timestamps
     time_cols = [
@@ -223,15 +225,10 @@ if "Date" in filtered.columns and len(sel_dates) == 2:
 # =========================
 # Exclusion of Demoters with "Not Responding" in Tags — DISABLED (keep all data)
 # =========================
-pre_analysis_df = filtered.copy()  # snapshot before any exclusions (we won't exclude now)
+pre_analysis_df = filtered.copy()
 excluded_mask = pd.Series(False, index=filtered.index)
 excluded_count = 0
-audit_payload = {
-    "pre": pre_analysis_df,
-    "post": filtered.copy(),
-    "mask": excluded_mask,
-    "count": excluded_count,
-}
+audit_payload = {"pre": pre_analysis_df, "post": filtered.copy(), "mask": excluded_mask, "count": excluded_count}
 
 # =========================
 # Helpers
@@ -243,7 +240,6 @@ def pct(n: float, d: float) -> float:
     return (100.0 * n / d) if d else 0.0
 
 def compute_nps(df_part: pd.DataFrame) -> float:
-    # Canonical NPS: percentages over ALL responses (Promoter + Neutral + Demoter)
     if "Feedback Head" not in df_part.columns or df_part.empty:
         return 0.0
     p = (df_part["Feedback Head"] == "Promoter").sum()
@@ -256,9 +252,16 @@ def compute_nps(df_part: pd.DataFrame) -> float:
 # =========================
 # Field resolvers & phone utils (for Customer Analysis)
 # =========================
-POSSIBLE_PHONE_COLS = ["Customer Phone", "customer_phone", "Phone", "Phone Number", "Contact", "Contact Number"]
+POSSIBLE_PHONE_COLS = [
+    "Customer CLI",              # <-- your sheet
+    "Customer Phone", "customer_phone",
+    "Phone", "Phone Number", "Contact", "Contact Number",
+]
 POSSIBLE_NAME_COLS  = ["Customer Name", "customer_name", "Name"]
-POSSIBLE_ADDR_COLS  = ["Customer Address", "customer_address", "Address", "Location"]
+POSSIBLE_ADDR_COLS  = [
+    "Customer Address", "customer_address",
+    "Delivery Address", "Address", "Location",
+]
 TICKET_ID_COLS      = ["Ticket number", "Ticket ID", "id", "ID"]
 
 def col_exists(frame: pd.DataFrame, candidates: list[str]) -> Optional[str]:
@@ -272,14 +275,23 @@ NAME_COL   = col_exists(df, POSSIBLE_NAME_COLS)
 ADDR_COL   = col_exists(df, POSSIBLE_ADDR_COLS)
 TICKET_COL = col_exists(df, TICKET_ID_COLS)
 
+# If there's no explicit address in the data, use Branch Name as an "address proxy"
+ADDRESS_PROXY_COL = None
+if not ADDR_COL and "Branch Name" in df.columns:
+    ADDRESS_PROXY_COL = "Branch Name"
+
 def digits_only(s: str) -> str:
-    return re.sub(r"\D+", "", s or "")
+    try:
+        s = str(s)
+    except Exception:
+        s = ""
+    return re.sub(r"\D+", "", s)
 
 def normalize_phone_series(s: pd.Series) -> pd.Series:
     try:
-        return s.fillna("").astype(str).map(digits_only)
+        return s.astype(str).map(digits_only)
     except Exception:
-        return pd.Series([""] * len(s))
+        return pd.Series([""] * len(s), index=s.index)
 
 # Precompute normalized phones for both full and filtered frames (if present)
 if PHONE_COL:
@@ -298,10 +310,10 @@ tabs = st.tabs([
     "Lifecycle & SLA",
     "Themes & Text",
     "Branch & Agent",
-    "Customer Analysis",   # NEW
+    "Customer Analysis",
     "Risk & Stability",
-    "Data Quality"
-    #"Classification Audit"
+    "Data Quality",
+    "Classification Audit",
 ])
 
 # ======================================================
@@ -754,7 +766,7 @@ with tabs[4]:
 with tabs[5]:
     st.title("Customer Analysis")
 
-    if not PHONE_COL and not NAME_COL and not ADDR_COL:
+    if not PHONE_COL and not NAME_COL and not (ADDR_COL or ADDRESS_PROXY_COL):
         st.info("No customer fields (phone/name/address) detected in your dataset.")
     else:
         st.caption("Tip: Filters on the left (branch, feedback, shift, dates) apply here as well.")
@@ -833,27 +845,45 @@ with tabs[5]:
 
         # ---------- Address Hotspots ----------
         st.subheader("Address Hotspots & Complaints")
-        if ADDR_COL:
-            addr_agg = cust_subset.groupby(ADDR_COL).agg(
+
+        # Choose the best available column to behave like an address
+        ADDR_USED = ADDR_COL or ADDRESS_PROXY_COL
+        ADDR_LABEL = "Address" if ADDR_COL else ("Branch (address proxy)" if ADDRESS_PROXY_COL else None)
+
+        if ADDR_USED:
+            addr_agg = cust_subset.groupby(ADDR_USED).agg(
                 Rows=(TICKET_COL or "Date", "count"),
-                Demoters=("Feedback Head", lambda s: (s=="Demoter").sum()) if "Feedback Head" in cust_subset.columns else (TICKET_COL or "Date", "count")
+                Demoters=("Feedback Head", lambda s: (s == "Demoter").sum())
+                         if "Feedback Head" in cust_subset.columns else (TICKET_COL or "Date", "count"),
             ).reset_index()
+
             if "Demoters" in addr_agg.columns:
-                addr_agg["Demoter %"] = addr_agg["Demoters"]/addr_agg["Rows"]*100.0
-            # Top 20 by volume
+                addr_agg["Demoter %"] = addr_agg["Demoters"] / addr_agg["Rows"] * 100.0
+
+            # Top by volume
             top_addr = addr_agg.sort_values("Rows", ascending=False).head(20)
-            fig_addr_vol = px.bar(top_addr, x="Rows", y=ADDR_COL, orientation="h", text="Rows", title="Top Addresses by Volume (Top 20)")
+            fig_addr_vol = px.bar(
+                top_addr, x="Rows", y=ADDR_USED, orientation="h", text="Rows",
+                title=f"Top {ADDR_LABEL or 'Addresses'} by Volume (Top 20)"
+            )
             st.plotly_chart(fig_addr_vol, use_container_width=True)
 
-            # Worst 20 by Demoter % with min volume threshold
+            # Worst by demoter%
             if "Demoter %" in addr_agg.columns:
-                MIN_ROWS = st.slider("Minimum rows for 'high demoter%' addresses", 5, 100, 10, help="Only consider addresses with at least this many rows")
+                MIN_ROWS = st.slider(
+                    f"Minimum rows for 'high demoter %' {ADDR_LABEL or 'addresses'}",
+                    5, 100, 10,
+                    help="Only consider entries with at least this many rows",
+                )
                 worst_addr = addr_agg.query("Rows >= @MIN_ROWS").sort_values("Demoter %", ascending=False).head(20)
-                fig_addr_dem = px.bar(worst_addr, x="Demoter %", y=ADDR_COL, orientation="h", text=worst_addr["Demoter %"].round(1),
-                                      title=f"Worst Addresses by Demoter % (min {MIN_ROWS} rows)")
+                fig_addr_dem = px.bar(
+                    worst_addr, x="Demoter %", y=ADDR_USED, orientation="h",
+                    text=worst_addr["Demoter %"].round(1),
+                    title=f"Worst {ADDR_LABEL or 'Addresses'} by Demoter % (min {MIN_ROWS} rows)"
+                )
                 st.plotly_chart(fig_addr_dem, use_container_width=True)
         else:
-            st.info("No address column found; skipping address hotspot analysis.")
+            st.info("No address-like column found; skipping address hotspot analysis.")
 
         # ---------- Complaints by Customer & Address ----------
         st.subheader("Complaint Themes (Tags) by Customer / Address")
@@ -870,18 +900,30 @@ with tabs[5]:
                 st.dataframe(tag_counts, use_container_width=True, height=320)
 
             with right:
-                if ADDR_COL:
-                    st.markdown("**Tags × Address (heatmap)**")
+                if ADDR_USED:
+                    st.markdown(f"**Tags × {ADDR_LABEL or 'Address'} (heatmap)**")
                     top_tags_heat = cust_subset["Tags"].value_counts().head(15).index
                     tmp = cust_subset[cust_subset["Tags"].isin(top_tags_heat)]
                     if not tmp.empty:
-                        mat = tmp.pivot_table(index="Tags", columns=ADDR_COL, values=TICKET_COL or "Date", aggfunc="count", fill_value=0)
-                        top_addr_cols = cust_subset[ADDR_COL].value_counts().head(10).index
+                        mat = tmp.pivot_table(index="Tags", columns=ADDR_USED, values=TICKET_COL or "Date", aggfunc="count", fill_value=0)
+                        # limit columns to top locations by volume
+                        top_addr_cols = cust_subset[ADDR_USED].value_counts().head(10).index
                         mat = mat.reindex(columns=top_addr_cols, fill_value=0)
-                        fig_heat = px.imshow(mat, color_continuous_scale="YlOrRd", title="Tags × Address (Top 15 Tags × Top 10 Addresses)")
+                        fig_heat = px.imshow(mat, color_continuous_scale="YlOrRd", title=f"Tags × {ADDR_LABEL or 'Address'} (Top 15 Tags × Top 10)")
                         st.plotly_chart(fig_heat, use_container_width=True)
                 else:
                     st.info("Address column not available for Tags × Address heatmap.")
+
+        # ---------- Recent complaint table ----------
+        st.markdown("**Recent Complaints (filtered selection)**")
+        ADDR_USED = ADDR_COL or ADDRESS_PROXY_COL
+        compl_cols = [c for c in [TICKET_COL, NAME_COL, PHONE_COL, ADDR_USED, "Created At",
+                                  "Feedback Head", "Complaint Head", "Tags", "Description"] if c]
+        compl_view = cust_subset.copy()
+        if "Created At" in compl_view.columns:
+            compl_view = compl_view.sort_values("Created At", ascending=False)
+        if compl_cols:
+            st.dataframe(compl_view[compl_cols].head(100), use_container_width=True, height=360)
 
         # ---------- Customer timeline (if a single customer selected) ----------
         st.subheader("Customer Timeline (if single customer match)")
@@ -903,8 +945,9 @@ with tabs[5]:
                 fig_tl = px.line(tl, x="Created At", y="Rows", markers=True, title="Chronological Ticket Counts")
                 st.plotly_chart(fig_tl, use_container_width=True)
 
-            cols = [c for c in [TICKET_COL,"Created At","Branch Name","Tags","Feedback Head","Description","SLA Breach","Re-Opened","TTR_min","FRT_min"] if c in one.columns]
-            st.dataframe(one[cols].tail(25), use_container_width=True, height=360)
+            cols = [c for c in [TICKET_COL,"Created At","Branch Name","Tags","Feedback Head","Description","SLA Breach","Re-Opened","TTR_min","FRT_min"] if c and c in one.columns]
+            if cols:
+                st.dataframe(one[cols].tail(25), use_container_width=True, height=360)
         else:
             st.caption("Select a single phone or name to see a per-customer timeline.")
 
@@ -992,3 +1035,58 @@ with tabs[7]:
         st.dataframe(sanity, use_container_width=True)
     else:
         st.info("No timestamp rules evaluated (required columns missing).")
+
+# ======================================================
+# 9) CLASSIFICATION AUDIT
+# ======================================================
+with tabs[8]:
+    st.title("Exclusions Audit — Demoter with 'Not Responding'")
+
+    if "audit_payload" not in locals():
+        st.info("No audit payload available.")
+    else:
+        pre = audit_payload["pre"]
+        post = audit_payload["post"]
+        mask = audit_payload["mask"]
+        excl_count = audit_payload["count"]
+
+        st.metric("Rows excluded (Demoter AND 'Not Responding')", excl_count)
+
+        if excl_count > 0:
+            affected = pre.loc[mask].copy()
+
+            if "Branch Name" in affected.columns:
+                st.subheader("Excluded by Branch")
+                b = affected["Branch Name"].value_counts().reset_index()
+                b.columns = ["Branch", "Count"]
+                fig_b = px.bar(b, x="Count", y="Branch", orientation="h", text="Count",
+                               title="Excluded (Demoter + 'Not Responding') by Branch")
+                st.plotly_chart(fig_b, use_container_width=True)
+
+            if "Shift" in affected.columns:
+                st.subheader("Excluded by Shift")
+                s = affected["Shift"].value_counts().reset_index()
+                s.columns = ["Shift", "Count"]
+                s["Shift (Time)"] = s["Shift"].map(lambda x: f"{x} ({SHIFT_TIMES.get(x,'')})")
+                fig_s = px.bar(s, x="Count", y="Shift (Time)", orientation="h", text="Count",
+                               title="Excluded (Demoter + 'Not Responding') by Shift")
+                st.plotly_chart(fig_s, use_container_width=True)
+
+            if "WeekStart" in affected.columns:
+                st.subheader("Exclusions over Time (ISO Week)")
+                w = affected.groupby("WeekStart").size().reset_index(name="Count").sort_values("WeekStart")
+                fig_w = px.line(w, x="WeekStart", y="Count", markers=True, title="Weekly Count of Excluded Rows")
+                st.plotly_chart(fig_w, use_container_width=True)
+
+            st.subheader("Excluded Rows (details)")
+            cols = [c for c in [
+                "Ticket number","Created At","Branch Name","Shift","DayOfWeek",
+                "Tags","Feedback Head","Description"
+            ] if c in pre.columns]
+            if cols:
+                st.dataframe(affected[cols].sort_values("Created At").reset_index(drop=True),
+                             use_container_width=True, height=380)
+            else:
+                st.info("No suitable columns available to display excluded rows.")
+        else:
+            st.success("No Demoter rows with 'Not Responding' were found.")
