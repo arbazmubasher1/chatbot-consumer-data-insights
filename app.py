@@ -843,6 +843,82 @@ with tabs[5]:
         else:
             st.info("No phone or name column found to build per-customer rollups.")
 
+
+
+        # ---------- Repeat Customers by Branch (Top Numbers) ----------
+        st.subheader("Repeat Customers by Branch (Top Numbers)")
+
+        if PHONE_COL and "_PhoneNorm" in cust_subset.columns and "Branch Name" in cust_subset.columns:
+            rep = cust_subset.copy()
+
+            # Build (Branch, Phone) pairs with counts & last seen
+            per_pair = rep.groupby(["Branch Name", "_PhoneNorm"]).agg(
+                Tickets=(TICKET_COL or "Date", "count"),
+                LastSeen=("Created At", "max") if "Created At" in rep.columns else (TICKET_COL or "Date", "count")
+            ).reset_index()
+
+            # Summary: how many repeat customers per branch (>=2 tickets)
+            repeat_mask = per_pair["Tickets"] >= 2
+            branch_repeat = per_pair.groupby("Branch Name").agg(
+                UniqueCustomers=("_PhoneNorm", "nunique"),
+                RepeatCustomers=("_PhoneNorm", lambda s: per_pair.loc[(per_pair["Branch Name"] == s.name) & repeat_mask, "_PhoneNorm"].nunique())
+            ).reset_index()
+            branch_repeat["Repeat %"] = np.where(
+                branch_repeat["UniqueCustomers"] > 0,
+                branch_repeat["RepeatCustomers"] / branch_repeat["UniqueCustomers"] * 100.0,
+                0.0
+            )
+
+            cA, cB = st.columns(2)
+            with cA:
+                fig_rep_abs = px.bar(
+                    branch_repeat.sort_values("RepeatCustomers", ascending=False),
+                    x="RepeatCustomers", y="Branch Name", orientation="h", text="RepeatCustomers",
+                    title="Repeat Customers (count) by Branch"
+                )
+                st.plotly_chart(fig_rep_abs, use_container_width=True)
+
+            with cB:
+                fig_rep_pct = px.bar(
+                    branch_repeat.sort_values("Repeat %", ascending=False),
+                    x="Repeat %", y="Branch Name", orientation="h", text=branch_repeat["Repeat %"].round(1),
+                    title="Repeat Customers (% of unique) by Branch"
+                )
+                st.plotly_chart(fig_rep_pct, use_container_width=True)
+
+            # Top N numbers per branch (ranked by ticket count)
+            st.markdown("**Top Numbers per Branch**")
+            TOP_N = st.slider("Show top N numbers per branch", 3, 20, 10, key="top_numbers_per_branch")
+            top_per_branch = (
+                per_pair.sort_values(["Branch Name", "Tickets", "LastSeen"], ascending=[True, False, False])
+                .groupby("Branch Name")
+                .head(TOP_N)
+                .reset_index(drop=True)
+                .rename(columns={"_PhoneNorm": "Customer CLI (normalized)"})
+            )
+
+            # Nice ordering: largest repeaters first
+            order_br = top_per_branch.groupby("Branch Name")["Tickets"].sum().sort_values(ascending=False).index
+            top_per_branch["Branch Name"] = pd.Categorical(top_per_branch["Branch Name"], categories=order_br, ordered=True)
+            st.dataframe(
+                top_per_branch.sort_values(["Branch Name", "Tickets"], ascending=[True, False]),
+                use_container_width=True, height=420
+            )
+
+            # Optional: visual “who repeats most” within each branch (faceted chart)
+            st.markdown("**Visual: Top Numbers within Each Branch**")
+            fig_facet = px.bar(
+                top_per_branch, x="Tickets", y="Customer CLI (normalized)",
+                orientation="h", facet_row="Branch Name",
+                title="Top Repeat Numbers per Branch",
+                height=min(1200, max(400, 120 * top_per_branch["Branch Name"].nunique()))
+            )
+            fig_facet.update_layout(showlegend=False)
+            st.plotly_chart(fig_facet, use_container_width=True)
+
+        else:
+            st.info("Phone column or Branch Name not available for repeat-customer grouping.")
+
         # ---------- Address Hotspots ----------
         st.subheader("Address Hotspots & Complaints")
 
